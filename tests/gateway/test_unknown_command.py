@@ -371,3 +371,60 @@ async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
     # First emit_collect fires on the original command; after rewrite the
     # dispatcher does NOT re-fire for the new command (one decision per turn).
     assert call_log == ["command:status"]
+
+
+@pytest.mark.asyncio
+async def test_pre_agent_message_hook_can_handle_plain_message(monkeypatch):
+    """message:pre_agent can short-circuit plain chat before the agent starts."""
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    runner._run_agent = AsyncMock(
+        side_effect=AssertionError("handled plain message leaked to the agent")
+    )
+    runner._handle_message_with_agent = AsyncMock(
+        side_effect=AssertionError("handled plain message reached agent wrapper")
+    )
+    runner.hooks.emit_collect = AsyncMock(
+        return_value=[{"decision": "handled", "message": "pre-agent handled"}]
+    )
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(_make_event("mach das im Hintergrund"))
+
+    assert result == "pre-agent handled"
+    runner._run_agent.assert_not_called()
+    runner._handle_message_with_agent.assert_not_called()
+    call_args = runner.hooks.emit_collect.await_args
+    assert call_args is not None
+    assert call_args.args[0] == "message:pre_agent"
+    ctx = call_args.args[1]
+    assert ctx["message"] == "mach das im Hintergrund"
+    assert ctx["source"] == _make_source()
+    assert ctx["gateway"] is runner
+
+
+@pytest.mark.asyncio
+async def test_pre_agent_message_hook_can_deny_plain_message(monkeypatch):
+    """A deny decision blocks a plain message before the agent starts."""
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    runner._handle_message_with_agent = AsyncMock(
+        side_effect=AssertionError("denied plain message reached agent wrapper")
+    )
+    runner.hooks.emit_collect = AsyncMock(
+        return_value=[{"decision": "deny", "message": "plain blocked"}]
+    )
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(_make_event("normal text"))
+
+    assert result == "plain blocked"
+    runner._handle_message_with_agent.assert_not_called()
