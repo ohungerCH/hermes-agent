@@ -221,6 +221,29 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "piper": 5000,        # local VITS model, phoneme-based; practical cap
 }
 
+GERMAN_ORDERED_LIST_WORDS = {
+    1: "erstens",
+    2: "zweitens",
+    3: "drittens",
+    4: "viertens",
+    5: "fünftens",
+    6: "sechstens",
+    7: "siebtens",
+    8: "achtens",
+    9: "neuntens",
+    10: "zehntens",
+    11: "elftens",
+    12: "zwölftens",
+    13: "dreizehntens",
+    14: "vierzehntens",
+    15: "fünfzehntens",
+    16: "sechzehntens",
+    17: "siebzehntens",
+    18: "achtzehntens",
+    19: "neunzehntens",
+    20: "zwanzigstens",
+}
+
 # ElevenLabs caps vary by model_id. https://elevenlabs.io/docs/overview/models
 ELEVENLABS_MODEL_MAX_TEXT_LENGTH: Dict[str, int] = {
     "eleven_v3": 5000,
@@ -321,6 +344,88 @@ def _load_tts_config() -> Dict[str, Any]:
 def _get_provider(tts_config: Dict[str, Any]) -> str:
     """Get the configured TTS provider name."""
     return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
+
+
+def _truthy_config(value: Any) -> Optional[bool]:
+    """Return a bool for common config spellings, or None for auto/unset."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return None
+
+
+def _looks_like_german_tts(provider: str, tts_config: Dict[str, Any]) -> bool:
+    """Infer whether TTS input should get German speech normalization."""
+    explicit_language = str(tts_config.get("language") or "").strip().lower()
+    if explicit_language.startswith("de") or explicit_language.startswith("german"):
+        return True
+
+    provider_section = _get_provider_section(tts_config, provider)
+    candidates = [
+        provider_section.get("voice"),
+        provider_section.get("voice_id"),
+        provider_section.get("language"),
+        provider_section.get("language_code"),
+    ]
+    for candidate in candidates:
+        value = str(candidate or "").strip().lower()
+        if value.startswith("de") or value.startswith("german"):
+            return True
+    return False
+
+
+def _normalize_german_ordered_list_markers(text: str) -> str:
+    """Make Markdown-style ordered lists pronounceable for German TTS.
+
+    Voice providers often read ``1.``/``2.`` literally ("eins Punkt") or as
+    ordinal adjectives.  At the start of list lines, convert them to German
+    adverbial enumeration words ("erstens", "zweitens", "drittens", ...).
+    The line-start guard intentionally avoids touching versions, decimals,
+    dates, addresses, and other inline numbers.
+    """
+    marker_re = re.compile(r"^(?P<indent>\s*)(?P<num>\d{1,2})(?P<marker>[.)])\s+", re.MULTILINE)
+
+    def repl(match: re.Match[str]) -> str:
+        num = int(match.group("num"))
+        word = GERMAN_ORDERED_LIST_WORDS.get(num)
+        if not word:
+            return match.group(0)
+        return f"{match.group('indent')}{word}: "
+
+    return marker_re.sub(repl, text)
+
+
+def _normalize_chur_pronunciation_for_tts(text: str) -> str:
+    """Rewrite the Swiss city name Chur for TTS pronunciation only.
+
+    Several German voices pronounce ``Chur`` like ``Schur``.  The canonical
+    written form must remain ``Chur`` in files, route planning, search, and
+    reasoning; this helper runs only on the provider input immediately before
+    synthesis so speech engines get the intended hard-K + audible-H cue.
+    """
+    return re.sub(r"\bChur\b", "Khur", text)
+
+
+def _normalize_tts_input_text(text: str, provider: str, tts_config: Dict[str, Any]) -> str:
+    """Apply provider-independent pronunciation fixes before synthesis."""
+    result = text
+
+    chur_mode = _truthy_config(tts_config.get("normalize_chur_pronunciation"))
+    if chur_mode is not False:
+        result = _normalize_chur_pronunciation_for_tts(result)
+
+    list_mode = _truthy_config(tts_config.get("normalize_ordered_lists"))
+    if list_mode is False:
+        return result
+    if list_mode is True or _looks_like_german_tts(provider, tts_config):
+        return _normalize_german_ordered_list_markers(result)
+    return result
 
 
 # ===========================================================================
@@ -1864,6 +1969,7 @@ def text_to_speech_tool(
 
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
+    text = _normalize_tts_input_text(text, provider, tts_config)
 
     # User-declared command provider (type: command under tts.providers.<name>)
     # resolves BEFORE the built-in dispatch. Built-in names short-circuit here

@@ -7317,6 +7317,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return self._telegram_topic_root_lobby_message()
             return None
 
+        # Deterministic voice/chat background control-plane.
+        # Explicit natural-language background starts must produce a concrete
+        # Kanban receipt before we acknowledge background execution. Status,
+        # stop, and CPU-like background questions are answered from evidence
+        # rather than routed through the free-form agent, preventing claims like
+        # "finished" and later "still consuming CPU" without a task/run handle.
+        if not command:
+            try:
+                from gateway.voice_background import (
+                    create_voice_background_task as _create_voice_bg_task,
+                    describe_voice_background_status as _describe_voice_bg_status,
+                    is_background_start_intent as _is_bg_start,
+                    is_background_status_intent as _is_bg_status,
+                )
+                _raw_bg_text = event.text or ""
+                if _is_bg_start(_raw_bg_text):
+                    _receipt = await _create_voice_bg_task(_raw_bg_text, source, self)
+                    return _receipt.message
+                if _is_bg_status(_raw_bg_text):
+                    return await _describe_voice_bg_status(self)
+            except Exception as _voice_bg_exc:
+                logger.warning("voice background control-plane failed: %s", _voice_bg_exc)
+                return (
+                    "Ich habe keinen verifizierten Hintergrundtask gestartet oder geprüft.\n"
+                    f"Grund: Background-Control-Plane fehlgeschlagen: {_voice_bg_exc}"
+                )
+
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,

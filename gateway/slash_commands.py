@@ -1809,6 +1809,16 @@ class GatewaySlashCommandsMixin:
             return t("gateway.background.usage")
 
         source = event.source
+
+        try:
+            from gateway.voice_background import create_voice_background_task
+            receipt = await create_voice_background_task(prompt, source, self)
+            if receipt.task_id:
+                return receipt.message
+            logger.warning("Kanban voice/background orchestration did not return a task handle; falling back to volatile /background: %s", receipt.create_output)
+        except Exception as exc:
+            logger.warning("Kanban voice/background orchestration failed; falling back to volatile /background: %s", exc)
+
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
 
         event_message_id = self._reply_anchor_for_event(event)

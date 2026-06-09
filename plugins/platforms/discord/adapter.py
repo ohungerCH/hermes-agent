@@ -2087,6 +2087,59 @@ class DiscordAdapter(BasePlatformAdapter):
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
+    def _client_voice_client_for_guild(self, guild_id: int):
+        """Return discord.py's live voice client for a guild, if any.
+
+        The adapter keeps its own ``_voice_clients`` map, but discord.py also
+        keeps an internal ``client.voice_clients`` list.  If our cleanup path
+        drops the adapter entry before Discord has fully disconnected, those
+        two views can diverge: ``/voice leave`` thinks we are absent while a
+        subsequent join fails with "Already connected".  Use the library view
+        as a recovery backstop.
+        """
+        client = getattr(self, "_client", None)
+        for vc in list(getattr(client, "voice_clients", []) or []):
+            guild = getattr(vc, "guild", None)
+            if getattr(guild, "id", None) == guild_id:
+                return vc
+        return None
+
+    def _voice_client_for_guild(self, guild_id: int):
+        """Return the tracked or discord.py-live voice client for a guild."""
+        vc = self._voice_clients.get(guild_id)
+        if vc is not None:
+            return vc
+        vc = self._client_voice_client_for_guild(guild_id)
+        if vc is not None:
+            self._voice_clients[guild_id] = vc
+        return vc
+
+    def _voice_client_connected(self, vc) -> bool:
+        if vc is None:
+            return False
+        try:
+            return bool(vc.is_connected())
+        except Exception:
+            return False
+
+    def _ensure_voice_receiver_started(self, guild_id: int, vc) -> None:
+        """Ensure inbound voice capture is running for an existing VC."""
+        receiver = self._voice_receivers.get(guild_id)
+        if receiver is not None and getattr(receiver, "_running", False):
+            return
+        try:
+            receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+            receiver.start()
+            self._voice_receivers[guild_id] = receiver
+            old_task = self._voice_listen_tasks.pop(guild_id, None)
+            if old_task:
+                old_task.cancel()
+            self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
+                self._voice_listen_loop(guild_id)
+            )
+        except Exception as e:
+            logger.warning("Voice receiver failed to start: %s", e)
+
     async def join_voice_channel(self, channel) -> bool:
         """Join a Discord voice channel. Returns True on success."""
         if not self._client or not DISCORD_AVAILABLE:
@@ -2094,30 +2147,42 @@ class DiscordAdapter(BasePlatformAdapter):
         guild_id = channel.guild.id
 
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
-            # Already connected in this guild?
-            existing = self._voice_clients.get(guild_id)
-            if existing and existing.is_connected():
-                if existing.channel.id == channel.id:
+            # Already connected in this guild?  Check both adapter state and
+            # discord.py's internal voice_clients list to recover from stale
+            # partial disconnects.
+            existing = self._voice_client_for_guild(guild_id)
+            if existing is not None and self._voice_client_connected(existing):
+                if getattr(getattr(existing, "channel", None), "id", None) == channel.id:
+                    self._ensure_voice_receiver_started(guild_id, existing)
                     self._reset_voice_timeout(guild_id)
                     return True
                 await existing.move_to(channel)
+                self._ensure_voice_receiver_started(guild_id, existing)
                 self._reset_voice_timeout(guild_id)
                 return True
 
-            vc = await channel.connect()
+            try:
+                vc = await channel.connect()
+            except Exception as e:
+                # discord.py can reject a new connect with "Already connected"
+                # even when our adapter map is stale/empty.  Reconcile from the
+                # library's own voice_clients list and treat that as success.
+                err_lower = str(e).lower()
+                recovered = self._client_voice_client_for_guild(guild_id)
+                if "already connected" in err_lower and self._voice_client_connected(recovered):
+                    self._voice_clients[guild_id] = recovered
+                    self._ensure_voice_receiver_started(guild_id, recovered)
+                    self._reset_voice_timeout(guild_id)
+                    logger.warning(
+                        "Recovered stale Discord voice state for guild %s after Already connected",
+                        guild_id,
+                    )
+                    return True
+                raise
+
             self._voice_clients[guild_id] = vc
             self._reset_voice_timeout(guild_id)
-
-            # Start voice receiver (Phase 2: listen to users)
-            try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
-                receiver.start()
-                self._voice_receivers[guild_id] = receiver
-                self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
-                    self._voice_listen_loop(guild_id)
-                )
-            except Exception as e:
-                logger.warning("Voice receiver failed to start: %s", e)
+            self._ensure_voice_receiver_started(guild_id, vc)
 
             # Phase 3: install the continuous mixer (ambient bed + ducked
             # speech).  Best-effort — if it fails we fall back to the legacy
@@ -2145,16 +2210,20 @@ class DiscordAdapter(BasePlatformAdapter):
             if getattr(self, "_voice_mixers", None) is not None:
                 self._voice_mixers.pop(guild_id, None)
 
-            vc = self._voice_clients.pop(guild_id, None)
-            if vc and vc.is_connected():
+            vc = self._voice_client_for_guild(guild_id)
+            if vc is not None and self._voice_client_connected(vc):
                 try:
                     if vc.is_playing():
                         vc.stop()
                 except Exception:
                     pass
-                await vc.disconnect()
+                try:
+                    await vc.disconnect()
+                except Exception as e:
+                    logger.warning("Error disconnecting Discord voice client for guild %s: %s", guild_id, e)
+            self._voice_clients.pop(guild_id, None)
             task = self._voice_timeout_tasks.pop(guild_id, None)
-            if task:
+            if task and task is not asyncio.current_task():
                 task.cancel()
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
@@ -2282,8 +2351,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def is_in_voice_channel(self, guild_id: int) -> bool:
         """Check if the bot is connected to a voice channel in this guild."""
-        vc = self._voice_clients.get(guild_id)
-        return vc is not None and vc.is_connected()
+        vc = self._voice_client_for_guild(guild_id)
+        return vc is not None and self._voice_client_connected(vc)
 
     def get_voice_channel_info(self, guild_id: int) -> Optional[Dict[str, Any]]:
         """Return voice channel awareness info for the given guild.
@@ -2292,8 +2361,8 @@ class DiscordAdapter(BasePlatformAdapter):
         returns a dict with channel name, member list, count, and
         currently-speaking user IDs (from SSRC mapping).
         """
-        vc = self._voice_clients.get(guild_id)
-        if not vc or not vc.is_connected():
+        vc = self._voice_client_for_guild(guild_id)
+        if vc is None or not self._voice_client_connected(vc):
             return None
 
         channel = vc.channel
