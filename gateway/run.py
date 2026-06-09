@@ -7485,10 +7485,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
+                "chat_id": source.chat_id,
+                "thread_id": source.thread_id or "",
+                "chat_type": source.chat_type or "",
+                "session_key": _quick_key,
                 "command": canonical,
                 "raw_command": command,
                 "args": raw_args,
                 "raw_args": raw_args,
+                "message": event.text or "",
+                "source": source,
+                "event": event,
+                "gateway": self,
             }
             try:
                 hook_results = await self.hooks.emit_collect(
@@ -7924,32 +7932,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return self._telegram_topic_root_lobby_message()
             return None
 
-        # Deterministic voice/chat background control-plane.
-        # Explicit natural-language background starts must produce a concrete
-        # Kanban receipt before we acknowledge background execution. Status,
-        # stop, and CPU-like background questions are answered from evidence
-        # rather than routed through the free-form agent, preventing claims like
-        # "finished" and later "still consuming CPU" without a task/run handle.
+        # Decision-style hook for plain messages before the free-form agent loop.
+        # This is the generic extension point used by profile-local policy/
+        # orchestration hooks. Handlers may return:
+        #   {"decision": "handled", "message": "..."}  -> do not start agent
+        #   {"decision": "rewrite", "message": "..."}  -> replace event.text
+        #   {"decision": "deny", "message": "..."}     -> block with message
         if not command:
+            hook_ctx = {
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "chat_id": source.chat_id,
+                "thread_id": source.thread_id or "",
+                "chat_type": source.chat_type or "",
+                "session_key": _quick_key,
+                "message": event.text or "",
+                "source": source,
+                "event": event,
+                "gateway": self,
+            }
             try:
-                from gateway.voice_background import (
-                    create_voice_background_task as _create_voice_bg_task,
-                    describe_voice_background_status as _describe_voice_bg_status,
-                    is_background_start_intent as _is_bg_start,
-                    is_background_status_intent as _is_bg_status,
-                )
-                _raw_bg_text = event.text or ""
-                if _is_bg_start(_raw_bg_text):
-                    _receipt = await _create_voice_bg_task(_raw_bg_text, source, self)
-                    return _receipt.message
-                if _is_bg_status(_raw_bg_text):
-                    return await _describe_voice_bg_status(self)
-            except Exception as _voice_bg_exc:
-                logger.warning("voice background control-plane failed: %s", _voice_bg_exc)
-                return (
-                    "Ich habe keinen verifizierten Hintergrundtask gestartet oder geprüft.\n"
-                    f"Grund: Background-Control-Plane fehlgeschlagen: {_voice_bg_exc}"
-                )
+                hook_results = await self.hooks.emit_collect("message:pre_agent", hook_ctx)
+            except Exception as _hook_err:
+                logger.debug("message:pre_agent hook dispatch failed (non-fatal): %s", _hook_err)
+                hook_results = []
+
+            for hook_result in hook_results:
+                if not isinstance(hook_result, dict):
+                    continue
+                decision = str(hook_result.get("decision", "")).strip().lower()
+                if not decision or decision == "allow":
+                    continue
+                if decision == "deny":
+                    message = hook_result.get("message")
+                    return message if isinstance(message, str) and message else "Message was blocked by a hook."
+                if decision == "handled":
+                    message = hook_result.get("message")
+                    return message if isinstance(message, str) and message else None
+                if decision == "rewrite":
+                    new_message = hook_result.get("message", hook_result.get("text", ""))
+                    if isinstance(new_message, str) and new_message.strip():
+                        event.text = new_message.strip()
+                    break
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there

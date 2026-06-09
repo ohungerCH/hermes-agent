@@ -11,6 +11,8 @@ Events:
   - session:start       -- New session created (first message of a new session)
   - session:end         -- Session ends (user ran /new or /reset)
   - session:reset       -- Session reset completed (new session entry created)
+  - message:pre_agent   -- Plain inbound message before the free-form agent loop;
+                           decision hooks may return handled/deny/rewrite
   - agent:start         -- Agent begins processing a message
   - agent:step          -- Each turn in the tool-calling loop
   - agent:end           -- Agent finishes processing
@@ -30,6 +32,12 @@ Context dict passed to ``agent:start`` / ``agent:end`` handlers:
 
 ``agent:end`` adds:
   response     -- agent response text (truncated to 500 chars)
+
+``message:pre_agent`` and ``command:*`` are decision-style hooks. They may
+return a dict with ``decision`` equal to ``handled``, ``deny``, ``rewrite``, or
+``allow``. ``message:pre_agent`` receives the raw ``event``, ``source``, and
+``gateway`` objects in addition to serialisable fields, so profile-local hooks
+can implement deterministic routing before the model starts.
 
 Handlers posting a follow-up into the same Telegram forum-topic should
 include ``message_thread_id=int(thread_id)`` when ``chat_type == "forum"``
