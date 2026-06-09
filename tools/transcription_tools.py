@@ -29,6 +29,7 @@ Usage::
 
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -740,6 +741,43 @@ def _transcribe_command_stt(
         "transcript": transcript_text,
         "provider": provider_name,
     }
+
+
+def _normalize_chur_aliases_in_transcript(text: str) -> str:
+    """Normalize likely spoken/transcribed variants of the user's city to Chur.
+
+    This is an STT-side semantic cleanup, not a TTS pronunciation rewrite.  It
+    keeps downstream routing, weather, search, and notes using the canonical
+    Swiss city spelling while tolerating common voice transcripts such as
+    ``Khur`` or the wrong German-style ``Schur``.  The plain German word
+    ``Kur`` is normalized only in common location contexts to avoid corrupting
+    phrases about a medical/spa cure.
+    """
+    if not text:
+        return text
+    normalized = re.sub(r"\b(?:Khur|Kuur|Schur)\b", "Chur", text, flags=re.IGNORECASE)
+    location_context_re = re.compile(
+        r"\b(?P<prefix>(?:in|von|nach|ab|bei|um|aus|start(?:e|en)?\s+in|route\s+(?:ab|von|nach))\s+)(?:der\s+Stadt\s+)?Kur\b",
+        flags=re.IGNORECASE,
+    )
+    return location_context_re.sub(lambda m: f"{m.group('prefix')}Chur", normalized)
+
+
+def _normalize_stt_result_transcript(result: Dict[str, Any], stt_config: dict) -> Dict[str, Any]:
+    """Apply configured transcript aliases to successful STT results."""
+    mode = is_truthy_value(stt_config.get("normalize_chur_aliases", True), default=True)
+    if not mode or not result.get("success"):
+        return result
+    transcript = result.get("transcript")
+    if not isinstance(transcript, str):
+        return result
+    normalized = _normalize_chur_aliases_in_transcript(transcript)
+    if normalized == transcript:
+        return result
+    updated = dict(result)
+    updated["transcript"] = normalized
+    updated["raw_transcript"] = transcript
+    return updated
 
 
 def _get_provider(stt_config: dict) -> str:
@@ -1655,43 +1693,52 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
 
     provider = _get_provider(stt_config)
 
+    result: Optional[Dict[str, Any]] = None
+
     if provider == "local":
         local_cfg = stt_config.get("local", {})
         model_name = _normalize_local_model(
             model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
         )
-        return _transcribe_local(file_path, model_name)
+        result = _transcribe_local(file_path, model_name)
+        return _normalize_stt_result_transcript(result, stt_config)
 
     if provider == "local_command":
         local_cfg = stt_config.get("local", {})
         model_name = _normalize_local_command_model(
             model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
         )
-        return _transcribe_local_command(file_path, model_name)
+        result = _transcribe_local_command(file_path, model_name)
+        return _normalize_stt_result_transcript(result, stt_config)
 
     if provider == "groq":
         model_name = model or DEFAULT_GROQ_STT_MODEL
-        return _transcribe_groq(file_path, model_name)
+        result = _transcribe_groq(file_path, model_name)
+        return _normalize_stt_result_transcript(result, stt_config)
 
     if provider == "openai":
         openai_cfg = stt_config.get("openai", {})
         model_name = model or openai_cfg.get("model", DEFAULT_STT_MODEL)
-        return _transcribe_openai(file_path, model_name)
+        result = _transcribe_openai(file_path, model_name)
+        return _normalize_stt_result_transcript(result, stt_config)
 
     if provider == "mistral":
         mistral_cfg = stt_config.get("mistral", {})
         model_name = model or mistral_cfg.get("model", DEFAULT_MISTRAL_STT_MODEL)
-        return _transcribe_mistral(file_path, model_name)
+        result = _transcribe_mistral(file_path, model_name)
+        return _normalize_stt_result_transcript(result, stt_config)
 
     if provider == "xai":
         # xAI Grok STT doesn't use a model parameter — pass through for logging
         model_name = model or "grok-stt"
-        return _transcribe_xai(file_path, model_name)
+        result = _transcribe_xai(file_path, model_name)
+        return _normalize_stt_result_transcript(result, stt_config)
 
     if provider == "elevenlabs":
         elevenlabs_cfg = stt_config.get("elevenlabs", {})
         model_name = model or elevenlabs_cfg.get("model_id", DEFAULT_ELEVENLABS_STT_MODEL)
-        return _transcribe_elevenlabs(file_path, model_name)
+        result = _transcribe_elevenlabs(file_path, model_name)
+        return _normalize_stt_result_transcript(result, stt_config)
 
     # User-declared command-type provider
     # (``stt.providers.<name>: type: command``). Fires after the built-in
@@ -1701,13 +1748,14 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
     # local than a plugin install (same precedence rule as TTS PR #17843).
     command_provider_config = _resolve_command_stt_provider_config(provider, stt_config)
     if command_provider_config is not None:
-        return _transcribe_command_stt(
+        result = _transcribe_command_stt(
             file_path,
             provider,
             command_provider_config,
             stt_config,
             model_override=model,
         )
+        return _normalize_stt_result_transcript(result, stt_config)
 
     # Plugin-registered STT backend (e.g. OpenRouter, SenseAudio,
     # Gemini-STT). Fires only when ``provider`` is neither a built-in
@@ -1733,7 +1781,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         language=plugin_language,
     )
     if plugin_result is not None:
-        return plugin_result
+        return _normalize_stt_result_transcript(plugin_result, stt_config)
 
     # No provider available
     return {

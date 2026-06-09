@@ -25,8 +25,17 @@ def _make_adapter():
     adapter._voice_timeout_tasks = {}
     adapter._voice_text_channels = {}
     adapter._voice_sources = {}
+    adapter._voice_mixers = {}
+    adapter._voice_fx_cfg = {"enabled": False}
     adapter._client = MagicMock()
+    setattr(adapter._client, "voice_clients", [])
     return adapter
+
+
+def _discard_coroutine_task(coro):
+    """Test helper: replace ensure_future without leaking created coroutines."""
+    coro.close()
+    return asyncio.create_task(asyncio.sleep(0))
 
 
 @pytest.mark.asyncio
@@ -63,8 +72,7 @@ async def test_concurrent_joins_do_not_double_connect():
     from plugins.platforms.discord import adapter as discord_mod
     with patch.object(discord_mod, "VoiceReceiver",
                       MagicMock(return_value=MagicMock(start=lambda: None))):
-        with patch.object(discord_mod.asyncio, "ensure_future",
-                          lambda _c: asyncio.create_task(asyncio.sleep(0))):
+        with patch.object(discord_mod.asyncio, "ensure_future", _discard_coroutine_task):
             t1 = asyncio.create_task(adapter.join_voice_channel(channel))
             t2 = asyncio.create_task(adapter.join_voice_channel(channel))
             await asyncio.sleep(0.05)
@@ -77,3 +85,72 @@ async def test_concurrent_joins_do_not_double_connect():
     )
     assert r1 is True and r2 is True
     assert 42 in adapter._voice_clients
+
+
+@pytest.mark.asyncio
+async def test_leave_recovers_discord_py_voice_client_when_adapter_map_is_stale():
+    """If adapter state lost the VC but discord.py still has it, /voice leave
+    must still disconnect instead of claiming the bot is absent."""
+    adapter = _make_adapter()
+
+    class FakeVC:
+        def __init__(self):
+            self.guild = MagicMock(id=42)
+            self.channel = MagicMock(id=111)
+            self.disconnected = False
+
+        def is_connected(self):
+            return not self.disconnected
+
+        def is_playing(self):
+            return False
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    vc = FakeVC()
+    setattr(adapter._client, "voice_clients", [vc])
+
+    assert adapter.is_in_voice_channel(42) is True
+    await adapter.leave_voice_channel(42)
+
+    assert vc.disconnected is True
+    assert adapter.is_in_voice_channel(42) is False
+
+
+@pytest.mark.asyncio
+async def test_join_recovers_when_channel_connect_says_already_connected():
+    """A stale discord.py voice client should be reconciled rather than
+    surfacing an contradictory "Already connected" join failure."""
+    adapter = _make_adapter()
+
+    class FakeVC:
+        def __init__(self, channel):
+            self.guild = MagicMock(id=42)
+            self.channel = channel
+
+        def is_connected(self):
+            return True
+
+        async def move_to(self, channel):
+            self.channel = channel
+
+    channel = MagicMock()
+    channel.id = 111
+    channel.guild.id = 42
+
+    async def connect_raises():
+        raise RuntimeError("Already connected to a voice channel.")
+
+    channel.connect = connect_raises
+    vc = FakeVC(channel)
+    setattr(adapter._client, "voice_clients", [vc])
+
+    from plugins.platforms.discord import adapter as discord_mod
+    with patch.object(discord_mod, "VoiceReceiver",
+                      MagicMock(return_value=MagicMock(start=lambda: None, _running=True))):
+        with patch.object(discord_mod.asyncio, "ensure_future", _discard_coroutine_task):
+            assert await adapter.join_voice_channel(channel) is True
+
+    assert adapter._voice_clients[42] is vc
+    assert 42 in adapter._voice_receivers
