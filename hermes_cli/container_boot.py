@@ -61,6 +61,7 @@ def reconcile_profile_gateways(
     scandir: Path,
     dry_run: bool = False,
     container_argv: Sequence[str] | None = None,
+    no_supervise: bool = False,
 ) -> list[ReconcileAction]:
     """Recreate s6 service registrations for every persistent profile.
 
@@ -88,6 +89,16 @@ def reconcile_profile_gateways(
             touching the filesystem. For tests and `--dry-run` debug.
         container_argv: Optional container PID 1 argv override. Production
             reads ``/proc/1/cmdline``; tests inject it directly.
+        no_supervise: When True, the default-profile gateway slot is
+            registered but NOT auto-started, even if its prior recorded
+            state was ``running``. Set for containers whose CMD is
+            ``hermes gateway run --no-supervise`` (the shadow api-server):
+            that foreground CMD already runs the sole default-profile
+            gateway, so an s6 auto-start of ``gateway-default`` would spawn
+            a SECOND default gateway → "already running" → the CMD exits →
+            container restart-loop. Driven by the ``HERMES_GATEWAY_NO_SUPERVISE``
+            env in :func:`main`. Named profiles are unaffected (the bug and
+            the shadow api-server only ever concern the default slot).
 
     Returns:
         One :class:`ReconcileAction` per profile, in this order:
@@ -108,7 +119,23 @@ def reconcile_profile_gateways(
         dry_run=dry_run,
     )
     default_prior_state = legacy_default_state or _read_desired_state(hermes_home)
-    default_should_start = default_prior_state in _AUTOSTART_STATES
+    # In --no-supervise mode the container's foreground CMD (`hermes gateway
+    # run --no-supervise`) IS the one-and-only default-profile gateway.
+    # Auto-starting the default s6 slot here would spawn a SECOND default
+    # gateway → "already running" → the CMD exits → the container restart-loops
+    # (the observed api-server bug: gateway_state.json persists "running", so
+    # every recreate re-triggered the auto-start). Register the slot DOWN
+    # instead: the landing slot for `hermes gateway start` is preserved, but
+    # nothing competes with the foreground CMD. Named profiles are untouched.
+    default_should_start = (
+        default_prior_state in _AUTOSTART_STATES and not no_supervise
+    )
+    if no_supervise and default_prior_state in _AUTOSTART_STATES:
+        log.info(
+            "no-supervise: default gateway slot registered down "
+            "(foreground CMD owns the default gateway; prior_state=%s)",
+            default_prior_state,
+        )
     if not dry_run:
         _cleanup_stale_runtime_files(hermes_home)
         _register_service(scandir, "default", start=default_should_start)
@@ -445,8 +472,14 @@ def main() -> int:
 
     hermes_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
     scandir = Path(os.environ.get("S6_PROFILE_GATEWAY_SCANDIR", "/run/service"))
+    # Same truthy parse as _maybe_migrate_legacy_gateway_run_state — a single
+    # recognized no-supervise signal. Set by the api-server compose so its
+    # foreground CMD gateway is the sole default gateway (no s6 auto-start).
+    no_supervise = os.environ.get(
+        "HERMES_GATEWAY_NO_SUPERVISE", ""
+    ).lower() in ("1", "true", "yes")
     actions = reconcile_profile_gateways(
-        hermes_home=hermes_home, scandir=scandir,
+        hermes_home=hermes_home, scandir=scandir, no_supervise=no_supervise,
     )
     for a in actions:
         print(

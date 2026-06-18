@@ -528,6 +528,107 @@ def test_default_slot_autostarts_when_root_state_running(tmp_path: Path) -> None
     assert not (scandir / "gateway-default" / "down").exists()
 
 
+def test_no_supervise_suppresses_default_autostart_with_persisted_running_state(
+    tmp_path: Path,
+) -> None:
+    """THE api-server recreate bug. A prior `hermes gateway run
+    --no-supervise` persisted gateway_state.json=running. On the next
+    recreate the reconciler must NOT auto-start the default slot — the
+    container's foreground CMD already runs the sole default gateway, so
+    an s6 auto-start would spawn a SECOND one ("already running" → CMD
+    exits → restart-loop). Register the slot DOWN, leave the persisted
+    state file untouched (no destructive pre-recreate cleanup needed)."""
+    scandir = tmp_path / "run-service"; scandir.mkdir()
+    _seed_default_root(tmp_path, state="running")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path, scandir=scandir, dry_run=False,
+        no_supervise=True,
+    )
+
+    default_action = next(a for a in actions if a.profile == "default")
+    # The REAL prior state is preserved in the action (honest reporting)...
+    assert default_action.prior_state == "running"
+    # ...but it is registered down, not started.
+    assert default_action.action == "registered"
+    assert (scandir / "gateway-default").is_dir()  # landing slot still present
+    assert (scandir / "gateway-default" / "down").exists()
+    # The persisted gateway_state.json is NOT mutated by the reconcile.
+    state = json.loads((tmp_path / "gateway_state.json").read_text())
+    assert state["gateway_state"] == "running"
+
+
+def test_no_supervise_leaves_named_profiles_autostarting(tmp_path: Path) -> None:
+    """no_supervise targets ONLY the default slot (the foreground CMD's
+    gateway). A named profile that was running still auto-starts: the
+    api-server bug and the shadow api-server only ever concern the
+    default slot, so the suppression is deliberately default-scoped."""
+    scandir = tmp_path / "run-service"; scandir.mkdir()
+    _seed_default_root(tmp_path, state="running")
+    _make_profile(tmp_path, "coder", state="running")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path, scandir=scandir, dry_run=False,
+        no_supervise=True,
+    )
+
+    default_action = next(a for a in actions if a.profile == "default")
+    assert default_action.action == "registered"  # default suppressed
+    assert (scandir / "gateway-default" / "down").exists()
+
+    coder_action = next(a for a in actions if a.profile == "coder")
+    assert coder_action.action == "started"  # named profile NOT suppressed
+    assert not (scandir / "gateway-coder" / "down").exists()
+
+
+@pytest.mark.parametrize(
+    "env_value, expect_started",
+    [
+        ("1", False),
+        ("true", False),
+        ("yes", False),
+        ("TRUE", False),
+        ("0", True),
+        ("false", True),
+        ("", True),
+    ],
+)
+def test_main_no_supervise_env_gates_default_autostart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: str,
+    expect_started: bool,
+) -> None:
+    """Production wiring: main() reads HERMES_GATEWAY_NO_SUPERVISE and
+    passes it through. Only the truthy spellings (1/true/yes, case-
+    insensitive — matching the legacy-seed parse) suppress the default
+    auto-start; falsy/empty leaves the engine's behavior intact."""
+    from hermes_cli import container_boot
+
+    scandir = tmp_path / "run-service"; scandir.mkdir()
+    _seed_default_root(tmp_path, state="running")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("S6_PROFILE_GATEWAY_SCANDIR", str(scandir))
+    monkeypatch.setenv("HERMES_GATEWAY_NO_SUPERVISE", env_value)
+    # Pin PID-1 argv to the api-server's foreground CMD (not the dashboard),
+    # so main()'s dashboard-skip doesn't short-circuit AND the test is
+    # independent of the host's real /proc/1/cmdline.
+    monkeypatch.setattr(
+        container_boot,
+        "_read_container_argv",
+        lambda: ("/init", "/opt/hermes/docker/main-wrapper.sh",
+                 "sh", "-c", "exec hermes gateway run --no-supervise"),
+    )
+
+    assert container_boot.main() == 0
+
+    down = scandir / "gateway-default" / "down"
+    if expect_started:
+        assert not down.exists()
+    else:
+        assert down.exists()
+
+
 @pytest.mark.parametrize(
     "container_argv",
     [
