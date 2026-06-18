@@ -801,6 +801,12 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Untrusted-origin transitive-closure flag (R1). 1 when the task was
+    # created by a deprivileged untrusted worker (HERMES_UNTRUSTED_ORIGIN
+    # set in the worker env by ``_default_spawn``). ``_default_spawn`` then
+    # re-deprivileges on dispatch via the same guard that handles the
+    # ``gateway-voice-background`` origin, so Gen-2/Gen-N stay sandboxed.
+    untrusted_origin: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -875,6 +881,9 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            untrusted_origin=(
+                row["untrusted_origin"] if "untrusted_origin" in keys else 0
             ),
         )
 
@@ -1037,7 +1046,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    -- Untrusted-origin transitive-closure flag (R1). 1 when the task was
+    -- created by a deprivileged untrusted worker (HERMES_UNTRUSTED_ORIGIN
+    -- set by _default_spawn). _default_spawn deprivileges these the same
+    -- way as the gateway-voice-background origin, closing the Gen-2+ loop.
+    untrusted_origin     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1693,6 +1707,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "untrusted_origin" not in cols:
+        # Untrusted-origin transitive-closure flag (R1). 1 when the task was
+        # created by a deprivileged untrusted worker (HERMES_UNTRUSTED_ORIGIN
+        # in the worker env, set by _default_spawn). ALTER ADD with NOT NULL
+        # is legal in sqlite because a DEFAULT is supplied.
+        _add_column_if_missing(
+            conn, "tasks", "untrusted_origin",
+            "untrusted_origin INTEGER NOT NULL DEFAULT 0",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2071,6 +2095,7 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    untrusted_origin: Optional[bool] = None,
     board: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
@@ -2098,6 +2123,42 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
+    # Untrusted-origin transitive-closure chokepoint (R1). ``create_task`` is
+    # the single worker-reachable DB inserter for ``tasks`` rows, so reading
+    # the untrusted signal here makes EVERY worker-reachable create path inherit
+    # the untrusted flag without an exhaustive path enumeration. An explicit
+    # ``untrusted_origin=`` argument (e.g. the decompose propagation at
+    # ``_decompose_task``, which carries the already-computed root value) wins
+    # outright and is never re-derived here.
+    #
+    # Two env signals drive the auto-derivation when no explicit flag is given:
+    #
+    #   1. HERMES_UNTRUSTED_ORIGIN — set by ``_default_spawn`` on the env of an
+    #      already-deprivileged untrusted worker. Stamps that worker's Gen-2+
+    #      cards untrusted, so the sandbox is inherited transitively. The
+    #      deprivileged ``-t web,vision`` worker has no execute_code / terminal
+    #      to mutate its own process env, so it cannot clear this.
+    #
+    #   2. ``_HERMES_GATEWAY`` set WITHOUT ``HERMES_KANBAN_TASK`` — a create that
+    #      runs directly in the gateway MAIN process (e.g. ``/kanban create`` via
+    #      ``run_slash`` from ``gateway/slash_commands._handle_kanban_command``,
+    #      or an in-gateway orchestrator ``kanban_create`` fan-out). Gateway
+    #      content is untrusted-origin by R1 (the speaker is not necessarily the
+    #      operator), and that path does NOT carry the
+    #      ``created_by="gateway-voice-background"`` marker nor
+    #      HERMES_UNTRUSTED_ORIGIN, so without this it would be created
+    #      full-privilege and ``_default_spawn`` would launch it unsandboxed
+    #      (Gen-1 laundering). Dispatcher-spawned workers always carry
+    #      HERMES_KANBAN_TASK and are excluded here — their own untrusted state
+    #      is already carried by signal (1). Standalone CLI / dashboard
+    #      processes do not set ``_HERMES_GATEWAY`` and stay trusted.
+    if untrusted_origin is None:
+        _env_untrusted = bool(os.environ.get("HERMES_UNTRUSTED_ORIGIN"))
+        _gateway_main_origin = (
+            os.environ.get("_HERMES_GATEWAY") == "1"
+            and not os.environ.get("HERMES_KANBAN_TASK")
+        )
+        untrusted_origin = _env_untrusted or _gateway_main_origin
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2236,8 +2297,9 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        untrusted_origin
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2259,6 +2321,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        1 if untrusted_origin else 0,
                     ),
                 )
                 for pid in parents:
@@ -4475,7 +4538,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "untrusted_origin "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -4484,6 +4548,15 @@ def decompose_triage_task(
         if root_row["status"] != "triage":
             return None
         tenant = root_row["tenant"]
+        # Untrusted-origin transitive closure (R1). ``decompose_triage_task`` is
+        # the second ``tasks``-row inserter and bypasses the ``create_task`` env
+        # chokepoint, so it must propagate the flag itself. An untrusted worker
+        # can create a ``triage=True`` card (which inherits ``untrusted_origin``
+        # via the chokepoint) and the auxiliary decomposer then fans it out
+        # here — without this, the children would dispatch with FULL privileges,
+        # escaping the sandbox. Propagate only when the root is untrusted, so
+        # trusted decompositions are unaffected.
+        root_untrusted = 1 if root_row["untrusted_origin"] else 0
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
         # rather than throwaway scratch tmp dirs. A child dict can still
@@ -4515,8 +4588,9 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, "
+                " untrusted_origin) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -4527,6 +4601,10 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    # Inherit the root triage card's untrusted flag (R1
+                    # transitive closure; decompose bypasses the create_task
+                    # env chokepoint, so it propagates explicitly here).
+                    root_untrusted,
                 ),
             )
             _append_event(
@@ -6731,6 +6809,18 @@ def _default_spawn(
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
+    # Untrusted-origin transitive closure (R1). A task is untrusted either
+    # because it is the Gen-1 gateway voice/chat origin (``created_by`` marker)
+    # OR because it was created by an already-deprivileged untrusted worker
+    # (``untrusted_origin`` flag, stamped by the ``create_task`` env chokepoint
+    # when HERMES_UNTRUSTED_ORIGIN was present). Both branches get the SAME
+    # deprivilege below, and the env var set here re-stamps any Gen-2 cards the
+    # worker creates — so Gen-2, Gen-3, ... inherit the sandbox transitively.
+    is_untrusted = (
+        task.created_by == "gateway-voice-background"
+        or bool(task.untrusted_origin)
+    )
+
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
@@ -6804,6 +6894,29 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    # Untrusted-origin deprivilege (R1): tasks created from the gateway
+    # voice/chat background path carry natural-language content that may be
+    # attacker-influenced (the speaker is not necessarily the operator).
+    # For that origin we (a) force the dangerous-command / execute_code
+    # approval gate ON for this worker explicitly — `check_all_command_guards`
+    # routes any `is_ask` worker without a registered gateway notify callback
+    # to the synchronous `pending_approval` fallback, so the command is
+    # withheld rather than auto-approved — and (b) strip any inherited yolo
+    # bypass so the gate cannot be short-circuited. Set explicitly (not relying
+    # on gateway-process inheritance) so the guard still holds under
+    # dispatch_in_gateway=false / external-daemon / distributed deployments.
+    # HERMES_EXEC_ASK alone is sufficient (approval.py: `is_ask` skips the
+    # no-block path and enters the deny flow); HERMES_GATEWAY_SESSION is
+    # deliberately NOT set here because it has unrelated surface-detection
+    # side effects (terminal sudo messaging, skills gateway-surface setup).
+    if is_untrusted:
+        env["HERMES_EXEC_ASK"] = "1"
+        env.pop("HERMES_YOLO_MODE", None)
+        # Transitive closure (R1): mark THIS worker's process env untrusted so
+        # any card it creates via the ``create_task`` chokepoint is stamped
+        # ``untrusted_origin=1`` and re-enters this same guard on dispatch.
+        env["HERMES_UNTRUSTED_ORIGIN"] = "1"
+
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
@@ -6849,6 +6962,19 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
+    # Untrusted-origin deprivilege (R1): narrow the worker's capability
+    # surface for the gateway voice/chat background origin to research-only
+    # toolsets. This excludes `terminal`/`process`, `execute_code`, and
+    # `delegate_task` (the sub-agent escape hatch) entirely — structural
+    # removal an injected prompt cannot bypass (unlike the shell approval
+    # gate above, which a container backend could auto-approve). The kanban
+    # lifecycle tools are NOT lost: get_tool_definitions auto-appends the
+    # `kanban` toolset whenever HERMES_KANBAN_TASK is set (which the
+    # dispatcher always sets), so the worker can still comment/heartbeat/
+    # complete/block its card. `-t` is owned by the chat subparser, so it
+    # is placed after the `chat` token.
+    if is_untrusted:
+        cmd.extend(["-t", "web,vision"])
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

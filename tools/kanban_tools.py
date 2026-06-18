@@ -814,6 +814,15 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                # ``created_by`` stays the real profile for correct attribution
+                # and so ``_verify_created_cards`` (kanban_db) still matches a
+                # Gen-2 card to its completing worker — do NOT overwrite it with
+                # an untrusted marker. Untrusted-origin inheritance is carried
+                # separately by the ``untrusted_origin`` flag, which
+                # ``kb.create_task`` reads from the HERMES_UNTRUSTED_ORIGIN env
+                # chokepoint automatically. That single source of truth means a
+                # deprivileged Gen-1 worker's child cards are stamped untrusted
+                # here without re-attributing them (R1 transitive closure).
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
