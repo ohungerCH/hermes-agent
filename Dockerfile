@@ -28,7 +28,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # hermes process, the dashboard, and per-profile gateways.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev procps git openssh-client docker-cli xz-utils && \
+    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg libopus0 gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev procps git openssh-client docker-cli xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
 # ---------- s6-overlay install ----------
@@ -175,6 +175,24 @@ RUN npm install --prefer-offline --no-audit && \
 # while still making Matrix work in the published container. Fixes #30399.
 #
 # The editable link is created after the source copy below.
+#
+# jarvis: pin the venv to Python 3.11 to replicate the live runtime (3.11.15)
+# exactly. requires-python is >=3.11,<3.14, so WITHOUT a pin uv would pick the
+# image's system 3.13 (debian trixie) and rebuild the native wheels
+# (ctranslate2 / onnxruntime / av / faster-whisper / tokenizers) against a Python
+# the uv.lock was never resolved or tested under. uv fetches a self-contained
+# 3.11 (python-build-standalone), so native compiles use 3.11 headers, not the
+# apt python3.13-dev. Drop this pin once the lock is intentionally moved to 3.13.
+ENV UV_PYTHON=3.11
+# uv installs the managed CPython under $HOME/.local/share/uv; the build runs as
+# root, so it lands in /root/.local/share (0700). The venv symlinks its python
+# there, but the non-root runtime user (hermes, UID 10000) cannot traverse /root
+# -> `s6-applyuidgid hermes ... python` fails 'Permission denied' at boot (the
+# interpreter is world-x, but /root is not world-traversable). Pin the managed-
+# Python install dir under /opt/hermes so the later `chmod -R a+rX /opt/hermes`
+# makes the interpreter traversable/executable for any HERMES_UID. Lives in the
+# image layer (outside the /opt/data volume), like .playwright above.
+ENV UV_PYTHON_INSTALL_DIR=/opt/hermes/.uv-python
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
 RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
