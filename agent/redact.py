@@ -13,6 +13,42 @@ import re
 
 logger = logging.getLogger(__name__)
 
+# --- #2c: PII + Art.9-Health redaction for the LOG/AUDIT egress path ---------
+# The existing redact_sensitive_text() below covers secrets/URLs only. The
+# canonical stt_redaction lib (ops/services/stt-redaction) additionally covers
+# Email/Phone/IBAN/CreditCard/Health (Art.9, DSGVO) with checksum validation
+# (Luhn, IBAN mod-97, E.164 plausibility) and a fail-closed posture. It is
+# VENDORED into agent/_vendor/stt_redaction (vendor_stt.py --sync/--check,
+# mirroring media-discovery) rather than re-implemented, so there is exactly one
+# pattern source and no drift. See RedactingFormatter.format() for the single
+# call site (LOG egress ONLY -- never the functional/LLM transcript path).
+#
+# Import-Shim (mirrors media-discovery/app/redaction_log.py): test/dev sees the
+# lib via PYTHONPATH (stt_redaction); the built image sees the vendored copy as
+# the RELATIVE package agent._vendor.stt_redaction. If neither resolves we set
+# a sentinel and the formatter falls back to secrets-only redaction (the lib
+# add-on degrades to a no-op rather than crashing the logger or, worse,
+# silently disabling the existing secret redaction).
+try:  # test/dev: PYTHONPATH=.../ops/services/stt-redaction
+    from stt_redaction import redact as _stt_redact  # type: ignore
+    from stt_redaction import RedactionPolicy as _SttRedactionPolicy  # type: ignore
+except ModuleNotFoundError:
+    try:  # built image: vendored copy under agent/_vendor (COPY . . from repo root)
+        from ._vendor.stt_redaction import redact as _stt_redact  # type: ignore
+        from ._vendor.stt_redaction import RedactionPolicy as _SttRedactionPolicy  # type: ignore
+    except ModuleNotFoundError:  # pragma: no cover - defensive; vendoring should prevent this
+        _stt_redact = None  # type: ignore
+        _SttRedactionPolicy = None  # type: ignore
+
+# Log-egress policy: never RAISE inside the formatter (an exception would break
+# logging entirely). raise_on_error=False keeps it FAIL-CLOSED -- on any internal
+# error the lib returns a fully masked string, NEVER raw text. All PII/health
+# classes the engine secret path lacks are ON; secrets stay ON too as defense in
+# depth (idempotent over the [REDACTED:...] tags the secret pass already wrote).
+_STT_LOG_POLICY = (
+    _SttRedactionPolicy(raise_on_error=False) if _SttRedactionPolicy is not None else None
+)
+
 # Sensitive query-string parameter names (case-insensitive exact match).
 # Ported from nearai/ironclaw#2529 — catches tokens whose values don't match
 # any known vendor prefix regex (e.g. opaque tokens, short OAuth codes).
@@ -487,11 +523,35 @@ def _has_http_method_substring(text: str) -> bool:
 
 
 class RedactingFormatter(logging.Formatter):
-    """Log formatter that redacts secrets from all log messages."""
+    """Log formatter that redacts secrets AND PII/Art.9-health from log messages.
+
+    This is the SINGLE chokepoint for the LOG/AUDIT egress (hermes_logging.py
+    attaches it to every file/stream handler). It runs two passes on the fully
+    formatted line:
+      1. redact_sensitive_text() -- the engine's existing secret/URL pass
+         (partial head/tail masking, tuned + tested upstream).
+      2. stt_redaction.redact() -- #2c add-on covering Email/Phone/IBAN/
+         CreditCard/Health (Art.9) with checksum validation. Fail-closed
+         (raise_on_error=False -> a masked string, never raw text, never an
+         exception that would break logging).
+
+    SCOPE (deliberate): LOG egress ONLY. This does NOT touch the functional/LLM
+    transcript path (tools/transcription_tools.py), the user-echo, or session
+    persistence -- redacting those would break the incident-research use case.
+    """
 
     def __init__(self, fmt=None, datefmt=None, style='%', **kwargs):
         super().__init__(fmt, datefmt, style, **kwargs)
 
     def format(self, record: logging.LogRecord) -> str:
         original = super().format(record)
-        return redact_sensitive_text(original)
+        # Pass 1: existing secret/URL redaction (unchanged behaviour).
+        text = redact_sensitive_text(original)
+        # Pass 2: #2c PII + Art.9-health redaction for the log line. Gated on the
+        # same global toggle as the secret pass (_REDACT_ENABLED) so the documented
+        # security.redact_secrets opt-out stays a single, coherent switch. If the
+        # vendored lib is unavailable, fall through with pass-1 output (secrets
+        # already redacted) rather than crash the logger.
+        if _stt_redact is not None and _REDACT_ENABLED:
+            text, _report = _stt_redact(text, _STT_LOG_POLICY)
+        return text
