@@ -363,6 +363,91 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
         return None, _multimodal_validation_error(exc, param=param)
 
 
+# --- Action-Intent-Extraktion (Task #35, sichere Aktuation; no_mcp BEWAHRT) --------
+#
+# Das Brain bleibt tool-los (no_mcp): es hat genau EINEN Ausgabekanal -- Text. Ein
+# getypter Action-Intent kann daher nur als ABGEGRENZTER Block im Antworttext reisen.
+# Diese Funktion ist der "additive Feld"-Mechanismus aus Konzept §0.1/§1.2 (Form b):
+# der api-server (NICHT das Brain, NICHT die Bridge) findet ALLE Marker-Bloecke,
+# ENTFERNT sie aus dem TTS-Text (so bleibt der gesprochene Text sauber, das Brain
+# braucht kein Markup im sichtbaren Teil zu produzieren) und haengt die geparsten
+# Kandidaten als additives Antwortfeld `action_intent` an.
+#
+# BEWUSST DUMM (Arbeitsteilung, Advisor): diese Funktion ZAEHLT NICHT, VALIDIERT
+# NICHT und kennt die Lane NICHT. Sie extrahiert alle Kandidaten und reicht die LISTE
+# weiter. Die fail-closed Logik (0/1/>1-Regel, Diskriminator, Schema, Registry-Lookup,
+# Lane-Whitelist T1, Rate-Limit) lebt AUSSCHLIESSLICH im privilegierten Aktuations-Gate
+# (ops/services/actuation-gate, evaluate_intent -- ist fuer eine Liste gebaut und
+# erzwingt >1 -> DROP). Die ">1 -> DROP"-Verteidigung haelt NUR, wenn JEDER Kandidat
+# das Gate erreicht -- deshalb gibt die Engine die VOLLE Liste weiter und waehlt nie
+# selbst aus. Die Sicherheits-GRENZE ist die menschliche Out-of-Band-Bestaetigung,
+# NICHT dieses Parsing (Konzept §0.1) -- ein gefaelschter/fehlgeparster Block erzeugt
+# hoechstens eine Confirm-Karte, die der Owner ablehnt.
+#
+# Marker-Vertrag (SSOT: ops/contracts/jarvis_action_intent_schema.yaml; MUSS mit
+# JARVIS_PERSONA in jarvis-bridge-service.mjs uebereinstimmen, das das Brain anweist):
+_ACTION_INTENT_OPEN = "<<<JARVIS_ACTION_INTENT>>>"
+_ACTION_INTENT_CLOSE = "<<<END_JARVIS_ACTION_INTENT>>>"
+# DOTALL: ein Block darf Zeilenumbrueche enthalten (JSON pretty-printed). NON-GREEDY
+# (.*?): pro oeffnendem/schliessendem Paar genau ein Block -- ein zweiter Block wird
+# NICHT in den ersten verschluckt (sonst wuerde "injiziere zwei Intents" zu einem
+# scheinbar-einzelnen Block kollabieren und die >1->DROP-Regel im Gate umgehen).
+_ACTION_INTENT_RE = re.compile(
+    re.escape(_ACTION_INTENT_OPEN) + r"(.*?)" + re.escape(_ACTION_INTENT_CLOSE),
+    re.DOTALL,
+)
+# Sicherheits-Cap: hoechstens so viele Marker-Bloecke werden ueberhaupt geparst
+# (ReDoS-/Speicher-Schutz; eine adversariale Antwort mit hunderten Bloecken darf den
+# Turn nicht aufblaehen). >1 fuehrt im Gate ohnehin zu DROP -- der Cap ist nur eine
+# obere Schranke, KEINE 0/1/>1-Entscheidung (die trifft das Gate).
+_ACTION_INTENT_MAX_BLOCKS = 8
+
+
+def extract_action_intent(final_response: Any) -> tuple[str, Optional[list]]:
+    """Trennt Marker-abgegrenzte Action-Intent-Bloecke vom TTS-Text (Task #35).
+
+    Gibt ``(tts_text, candidates)`` zurueck:
+      - ``tts_text``: der Antworttext OHNE jeden Marker-Block (gesprochen-tauglich).
+      - ``candidates``: ``None`` wenn kein Block vorhanden war; sonst eine LISTE der
+        je Block JSON-geparsten Objekte (nicht-parsebare oder nicht-Objekt-Bloecke
+        werden uebersprungen, NICHT geraten). Die Liste KANN leer sein (Bloecke da,
+        aber keiner parsebar) -- das ist additiv und fail-soft; das Gate behandelt
+        eine leere/0-Kandidaten-Liste als NO_INTENT.
+
+    BEWUSST keine Validierung/Zaehlung hier (s. Modul-Kommentar). Wirft NIE:
+    ist ``final_response`` kein String, gibt es ``("", None)`` bzw. den String unveraendert.
+    """
+    if not isinstance(final_response, str) or _ACTION_INTENT_OPEN not in final_response:
+        # Kein Marker -> additive Feld bleibt aus (None). Schnellpfad ohne Regex.
+        return (final_response if isinstance(final_response, str) else ""), None
+
+    candidates: list = []
+    matched = 0
+    for m in _ACTION_INTENT_RE.finditer(final_response):
+        matched += 1
+        if matched > _ACTION_INTENT_MAX_BLOCKS:
+            break
+        raw = m.group(1).strip()
+        try:
+            obj = json.loads(raw)
+        except (ValueError, TypeError):
+            # Nicht-JSON-Block: NICHT raten, NICHT als Kandidat zaehlen. (Er wurde
+            # dennoch aus dem TTS-Text entfernt -- s. sub() unten.)
+            continue
+        candidates.append(obj)
+
+    # ALLE Bloecke aus dem sichtbaren Text entfernen (auch nicht-parsebare und solche
+    # ueber dem Cap), damit kein Markup vorgelesen wird. Doppel-Whitespace/Leerzeilen,
+    # die durch das Entfernen entstehen, kollabieren wir grob.
+    stripped = _ACTION_INTENT_RE.sub("", final_response)
+    stripped = re.sub(r"[ \t]{2,}", " ", stripped)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+
+    # Marker waren vorhanden -> immer eine Liste zurueckgeben (ggf. leer), damit der
+    # Aufrufer "Block(e) da, aber keiner valide" von "gar kein Block" unterscheiden kann.
+    return stripped, candidates
+
+
 def check_api_server_requirements() -> bool:
     """Check if API server dependencies are available."""
     return AIOHTTP_AVAILABLE
@@ -1572,18 +1657,29 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+        # Task #35 (sichere Aktuation, no_mcp BEWAHRT): einen evtl. vom Brain emittierten
+        # Action-Intent-Block aus dem TTS-Text trennen und als ADDITIVES Feld anhaengen
+        # (analog media_instruction, aber durch die strukturierte Antwort statt ein Tool --
+        # das Brain bleibt tool-los). FAIL-SOFT: extract_action_intent wirft nie; ist kein
+        # Marker da, bleibt content unveraendert und action_intent fehlt im Body. Die
+        # fail-closed Logik (0/1/>1, Schema, Lane T1, Registry) macht das Aktuations-Gate,
+        # NICHT die Engine (die kennt die Lane nicht). content traegt den bereinigten Text.
+        tts_text, action_intent = extract_action_intent(final_response)
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
-        return web.json_response(
-            {
-                "object": "hermes.session.chat.completion",
-                "session_id": effective_session_id or session_id,
-                "message": {"role": "assistant", "content": final_response},
-                "usage": usage,
-            },
-            headers=headers,
-        )
+        response_body: Dict[str, Any] = {
+            "object": "hermes.session.chat.completion",
+            "session_id": effective_session_id or session_id,
+            "message": {"role": "assistant", "content": tts_text},
+            "usage": usage,
+        }
+        if action_intent is not None:
+            # additiv: nur vorhanden, wenn das Brain mindestens einen Marker-Block emittierte.
+            # WERT = Liste der geparsten Kandidaten (kann leer sein); die Bridge reicht sie
+            # UNGEPRUEFT ans Gate weiter (kein Re-Parsing untrusted Texts in der Bridge = #34-Falle).
+            response_body["action_intent"] = action_intent
+        return web.json_response(response_body, headers=headers)
 
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
         """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
