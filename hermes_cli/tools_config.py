@@ -1486,6 +1486,14 @@ def _get_platform_tools(
             elif pts in _DEFAULT_OFF_TOOLSETS:
                 # Opt-in plugin toolset — stay off until user picks it
                 continue
+            elif platform in FAIL_CLOSED_PLATFORMS:
+                # jarvis fail-closed (ADR-0031): NEVER default-enable a plugin
+                # toolset on the untrusted lane. Plugin toolsets need an explicit
+                # opt-in here; drift from the pinned allowlist is caught by Lage 2
+                # (refuse-to-boot). Without this guard a bundled plugin not in
+                # _DEFAULT_OFF_TOOLSETS (e.g. google_meet) would default-enable on
+                # the [no_mcp] fail-closed path with zero opt-in (Befund #38-V1).
+                continue
             elif pts not in known_for_platform:
                 # New plugin not yet seen by hermes tools — default enabled
                 enabled_toolsets.add(pts)
@@ -1532,11 +1540,12 @@ def _get_platform_tools(
     }
     # jarvis: fail-closed toolset default (ADR-0031) -- REAPPLY-BACKSTOP MARKER.
     # MCP suppression spans BOTH decision sites below. For FAIL_CLOSED_PLATFORMS we
-    # suppress MCP on EVERY path -- not only when the "no_mcp" sentinel is present.
-    # This closes Befund #2 in its general form: a bare ``[]`` OR any non-empty list
-    # that resolves to zero configurable toolsets (e.g. an unknown name) would
-    # otherwise still pull every globally enabled MCP server into the untrusted Voice
-    # turn. Both sites branch on the same ``_suppress_mcp`` flag so they cannot drift.
+    # suppress MCP on EVERY path -- not only when the "no_mcp" sentinel is present --
+    # and in ALL name forms: bare server names AND the canonical "mcp-<server>"
+    # toolset alias (see the suppress branch; #38-V2). Together with the plugin
+    # default-enable guard above (#38-V1), the untrusted lane gets zero AUTO-enabled
+    # surface from MCP servers or bundled plugins. Both sites share the suppress_mcp
+    # flag so they cannot drift.
     # Abweichung vom Plan-Matrix-Sollwert (vermerkt, ADR-0031 §G): bei einem
     # explizit gelisteten UNBEKANNTEN Namen (z.B. ["does_not_exist"]) erwartet die
     # Matrix [] -- Lage 1 gibt hier den harmlosen Phantom-Namen zurueck (resolve_toolset
@@ -1549,7 +1558,22 @@ def _get_platform_tools(
     # Allow "no_mcp" sentinel to opt out of all MCP servers for this platform
     if suppress_mcp:
         explicit_mcp_servers = set()
-        enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers - {"no_mcp"})
+        # jarvis fail-closed (ADR-0031): on the untrusted fail-closed lane, suppress
+        # MCP in ALL its name forms -- both bare server names (enabled_mcp_servers) AND
+        # the canonical "mcp-<server>" toolset aliases, which the registry resolves to
+        # the connected server's FULL tool surface. Bare-name subtraction alone left an
+        # explicit ["mcp-foo"] passthrough as a leak (Befund #38-V2). SCOPED to
+        # FAIL_CLOSED_PLATFORMS so the "no_mcp" sentinel keeps its upstream semantics on
+        # general platforms (cli/discord) -- we do NOT silently diverge from upstream in
+        # this 1274-commits-behind fork as a side effect of a voice-lane fix.
+        mcp_alias_passthrough = (
+            {ts for ts in explicit_passthrough if ts.startswith("mcp-")}
+            if platform in FAIL_CLOSED_PLATFORMS
+            else set()
+        )
+        enabled_toolsets.update(
+            explicit_passthrough - enabled_mcp_servers - mcp_alias_passthrough - {"no_mcp"}
+        )
     else:
         explicit_mcp_servers = explicit_passthrough & enabled_mcp_servers
         enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers)

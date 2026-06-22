@@ -552,6 +552,65 @@ def test_non_failclosed_platform_still_loads_mcp_by_default():
     assert "some_mcp" in cli_enabled
 
 
+def test_api_server_canonical_mcp_alias_suppressed():
+    """Befund #38-V2: der KANONISCHE Toolset-Alias 'mcp-<server>' (nicht nur der
+    Bare-Name) muss auf der Voice-Bahn unterdrueckt werden -- sonst leakt eine
+    explizite ['mcp-foo']-Config die volle Tool-Surface des Servers. Set-Membership
+    auf der ROHEN _get_platform_tools-Ausgabe (nicht _resolved_tools, das ohne
+    Live-MCP-Verbindung auf [] kollabiert und den Leak maskiert). Faellt bei Revert."""
+    config = {
+        "platform_toolsets": {"api_server": ["mcp-foo"]},
+        "mcp_servers": {"foo": {"enabled": True}},
+    }
+    assert "mcp-foo" not in _get_platform_tools(config, "api_server")
+
+
+def test_non_failclosed_platform_keeps_canonical_mcp_alias():
+    """Kontrolle: fuer eine NICHT-fail-closed-Plattform (cli) bleibt der kanonische
+    'mcp-foo'-Alias erhalten -- beweist, dass der Name real ist und der V2-Fix gezielt
+    nur die Voice-Bahn unterdrueckt (sonst waere der V2-Test trivial gruen)."""
+    config = {
+        "platform_toolsets": {"cli": ["mcp-foo"]},
+        "mcp_servers": {"foo": {"enabled": True}},
+    }
+    assert "mcp-foo" in _get_platform_tools(config, "cli")
+
+
+def test_non_failclosed_no_mcp_keeps_custom_mcp_prefixed_toolset():
+    """Scope-Guard (#38-V2): der mcp-*-Strip ist auf FAIL_CLOSED_PLATFORMS begrenzt.
+    Auf einer NICHT-fail-closed-Plattform (cli) mit no_mcp-Sentinel bleibt ein
+    Custom-Toolset namens 'mcp-*' erhalten -- wir aendern die no_mcp-Upstream-Semantik
+    fuer cli/discord NICHT als Nebeneffekt des Voice-Lane-Fixes. (Faellt, wenn der
+    Strip wieder unkonditioniert auf jedem suppress_mcp feuert.)"""
+    config = {"platform_toolsets": {"cli": ["no_mcp", "mcp-custom"]}}
+    assert "mcp-custom" in _get_platform_tools(config, "cli")
+
+
+def test_api_server_plugin_toolset_not_default_enabled():
+    """Befund #38-V1: ein gebuendeltes Plugin-Toolset (nicht in _DEFAULT_OFF) darf
+    auf der fail-closed Voice-Bahn NICHT per Default aktiviert werden -- auch nicht
+    ueber den [no_mcp]-Produktions-Pfad. Vorher umging der Plugin-Block den
+    fail-closed-Boden vollstaendig. Faellt bei Revert."""
+    with patch(
+        "hermes_cli.tools_config._get_plugin_toolset_keys",
+        return_value={"acme_plugin"},
+    ):
+        for cfg in ({}, {"platform_toolsets": {"api_server": ["no_mcp"]}}):
+            enabled = _get_platform_tools(cfg, "api_server")
+            assert "acme_plugin" not in enabled, f"Plugin-Leak fuer {cfg!r}"
+
+
+def test_non_failclosed_platform_default_enables_plugin_toolset():
+    """Kontrolle: fuer cli (nicht fail-closed) wird dasselbe neue Plugin-Toolset
+    weiterhin per Default aktiviert -- beweist, dass der V1-Guard gezielt nur die
+    fail-closed-Bahn betrifft."""
+    with patch(
+        "hermes_cli.tools_config._get_plugin_toolset_keys",
+        return_value={"acme_plugin"},
+    ):
+        assert "acme_plugin" in _get_platform_tools({}, "cli")
+
+
 def test_toolset_has_keys_for_vision_accepts_codex_auth(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "auth.json").write_text(
