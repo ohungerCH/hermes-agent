@@ -419,6 +419,139 @@ def test_get_platform_tools_no_mcp_sentinel_does_not_affect_other_platforms():
     assert "exa" in cli_enabled
 
 
+# ─── ADR-0031: fail-CLOSED toolset default for api_server (Voice/STT = P10) ──────────
+# Beweis "Config-weg/unklar -> 0 Tools, MCP unterdrueckt" fuer die untrusted Voice-Bahn.
+# Der entscheidende Diskriminator ist ein ENABLED mcp_servers-Eintrag: nur damit
+# unterscheidet ein Test eine echte MCP-Suppression von der trivialen Leere eines
+# {}-Configs (das gar keine MCP-Server hat).
+
+from toolsets import resolve_toolset as _resolve_toolset  # noqa: E402
+
+# Pinned canonical-hash test vector (single source ueber Lage 2 + Lage 3 hinweg).
+# canonical(["no_mcp"]) == '["no_mcp"]' -> sha256
+_EXPECTED_NO_MCP_HASH = "sha256:a42f8a4d08423befd63b194a15bef683ce413c5d66fea5b399727b2540f0c064"
+
+# forbidden_floor aus ops/contracts/jarvis_voice_toolset_pin.yaml (lokal gespiegelt,
+# damit der Engine-Test nicht ins ops-Tree greift).
+_FORBIDDEN_FLOOR = {
+    "terminal", "process", "read_file", "write_file", "patch", "execute_code",
+    "delegate_task", "browser_navigate", "browser_click", "browser_type",
+    "cronjob", "skill_manage",
+}
+
+
+def _resolved_tools(names):
+    """Loest eine Toolset-Namensmenge in die echten Tool-Namen auf."""
+    out = set()
+    for n in names:
+        out.update(_resolve_toolset(n))
+    return out
+
+
+def test_fail_closed_platforms_includes_api_server():
+    from hermes_cli.tools_config import FAIL_CLOSED_PLATFORMS
+    assert "api_server" in FAIL_CLOSED_PLATFORMS
+
+
+def test_no_mcp_sentinel_is_empty_toolset():
+    """Das Sentinel selbst traegt keine Tools bei (resolve_toolset('no_mcp') -> [])."""
+    assert _resolve_toolset("no_mcp") == []
+
+
+def test_canonical_no_mcp_hash_matches_pinned_vector():
+    """Nicht-Drift-Anker: die Kanonisierung muss exakt diesen Hash liefern (gleiche
+    Regel wie Validator (Lage 3) und Boot-Wrapper (Lage 2))."""
+    import hashlib
+    import json
+    canon = json.dumps(sorted(["no_mcp"]), separators=(",", ":"))
+    h = "sha256:" + hashlib.sha256(canon.encode("utf-8")).hexdigest()
+    assert h == _EXPECTED_NO_MCP_HASH
+
+
+def test_api_server_missing_config_fail_closed():
+    """Schluessel fehlt / Config {} -> 0 echte Tools (kein Voll-Toolset-Fallback)."""
+    assert _resolved_tools(_get_platform_tools({}, "api_server")) == set()
+
+
+def test_api_server_null_config_fail_closed():
+    """platform_toolsets.api_server: null -> 0 echte Tools."""
+    config = {"platform_toolsets": {"api_server": None}}
+    assert _resolved_tools(_get_platform_tools(config, "api_server")) == set()
+
+
+def test_api_server_scalar_config_fail_closed():
+    """Skalar (api_server: foo) -> 0 echte Tools (kein list -> Fallback)."""
+    config = {"platform_toolsets": {"api_server": "foo"}}
+    assert _resolved_tools(_get_platform_tools(config, "api_server")) == set()
+
+
+def test_api_server_dict_config_fail_closed():
+    """Dict (Fehl-Einrueckung) -> 0 echte Tools."""
+    config = {"platform_toolsets": {"api_server": {"web": True}}}
+    assert _resolved_tools(_get_platform_tools(config, "api_server")) == set()
+
+
+def test_api_server_bare_empty_list_fail_closed():
+    """bare [] -> 0 echte Tools (== no_mcp-Semantik fuer die Voice-Bahn)."""
+    config = {"platform_toolsets": {"api_server": []}}
+    assert _resolved_tools(_get_platform_tools(config, "api_server")) == set()
+
+
+def test_api_server_no_mcp_happy_path_fail_closed():
+    """[no_mcp] -> 0 echte Tools (Happy-Path Voice-Boden)."""
+    config = {"platform_toolsets": {"api_server": ["no_mcp"]}}
+    assert _resolved_tools(_get_platform_tools(config, "api_server")) == set()
+
+
+def test_api_server_unknown_name_resolves_to_zero_tools():
+    """Unbekannter Name (["does_not_exist"]) -> 0 echte Tools, kein forbidden_floor.
+
+    Abweichung vom Plan-Matrix-Sollwert [] vermerkt (ADR-0031 §G): Lage 1 gibt den
+    harmlosen Phantom-Namen zurueck (resolve_toolset -> []); literales Clampen
+    expliziter Configs ist Lage 2 (Boot-Wrapper Hash-Refuse-to-boot). Die hier
+    geprueften Sicherheitseigenschaften (0 echte Tools, kein forbidden_floor) gelten.
+    """
+    config = {"platform_toolsets": {"api_server": ["does_not_exist"]}}
+    resolved = _resolved_tools(_get_platform_tools(config, "api_server"))
+    assert resolved == set()
+    assert not (resolved & _FORBIDDEN_FLOOR)
+
+
+def test_api_server_does_not_leak_enabled_mcp_servers():
+    """Diskriminator: selbst bei einem ENABLED mcp_servers-Eintrag darf KEIN
+    MCP-Server in die api_server-Toolmenge lecken -- ueber JEDEN unklaren Pfad
+    (fehlend/null/Skalar/Dict/bare []/unbekannter Name). Schliesst Befund #2 in
+    seiner allgemeinen Form."""
+    mcp = {"mcp_servers": {"evil_mcp": {"enabled": True}}}
+    inputs = [
+        {},  # fehlt
+        {"platform_toolsets": {"api_server": None}},  # null
+        {"platform_toolsets": {"api_server": "foo"}},  # Skalar
+        {"platform_toolsets": {"api_server": {"web": True}}},  # Dict
+        {"platform_toolsets": {"api_server": []}},  # bare []
+        {"platform_toolsets": {"api_server": ["does_not_exist"]}},  # unbekannt
+    ]
+    for base in inputs:
+        config = dict(base)
+        config.update(mcp)
+        enabled = _get_platform_tools(config, "api_server")
+        assert "evil_mcp" not in enabled, f"MCP-Leak fuer Input {base!r}"
+
+
+def test_non_failclosed_platform_keeps_default_fallback():
+    """Kontrolle: NICHT-fail-closed-Plattformen (cli) behalten den Voll-Default-
+    Fallback bei {} -- der fail-closed-Schalter ist bewusst nur api_server."""
+    cli_enabled = _get_platform_tools({}, "cli")
+    assert len(cli_enabled) > 0
+
+
+def test_non_failclosed_platform_still_loads_mcp_by_default():
+    """Kontrolle: cli (nicht fail-closed) zieht enabled MCP-Server weiterhin."""
+    config = {"mcp_servers": {"some_mcp": {"enabled": True}}}
+    cli_enabled = _get_platform_tools(config, "cli")
+    assert "some_mcp" in cli_enabled
+
+
 def test_toolset_has_keys_for_vision_accepts_codex_auth(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "auth.json").write_text(

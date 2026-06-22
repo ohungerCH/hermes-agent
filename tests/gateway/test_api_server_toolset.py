@@ -66,8 +66,11 @@ class TestApiServerPlatformConfig:
 
 class TestApiServerAdapterToolset:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
-    def test_create_agent_reads_config_toolsets(self):
-        """API server resolves toolsets from config like all other platforms."""
+    def test_create_agent_missing_config_resolves_fail_closed(self):
+        """fail-CLOSED (ADR-0031): a missing/empty config for the untrusted Voice
+        platform (api_server) must resolve to ZERO toolsets, NOT the full
+        hermes-api-server default. Inversion of the prior fail-open assertion
+        (was: ``len(toolsets) > 0``)."""
         from gateway.platforms.api_server import APIServerAdapter
         from gateway.config import PlatformConfig
 
@@ -82,7 +85,8 @@ class TestApiServerAdapterToolset:
                                         "provider": None, "api_mode": None,
                                         "command": None, "args": []}
             mock_model.return_value = "test/model"
-            # No platform_toolsets override — should fall back to hermes-api-server default
+            # No platform_toolsets override — fail-closed Voice-Boden (0 Tools),
+            # NOT a fallback to the full hermes-api-server toolset.
             mock_config.return_value = {}
             mock_agent_cls.return_value = MagicMock()
 
@@ -92,7 +96,7 @@ class TestApiServerAdapterToolset:
             call_kwargs = mock_agent_cls.call_args
             toolsets = call_kwargs.kwargs.get("enabled_toolsets")
             assert isinstance(toolsets, list)
-            assert len(toolsets) > 0
+            assert len(toolsets) == 0
             assert call_kwargs.kwargs.get("platform") == "api_server"
 
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)

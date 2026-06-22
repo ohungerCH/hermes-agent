@@ -230,6 +230,18 @@ PLATFORMS = {
     for k, info in _PLATFORMS_REGISTRY.items()
 }
 
+# jarvis: fail-closed toolset default (ADR-0031) -- REAPPLY-BACKSTOP MARKER.
+# Security-kritische Plattformen, deren Toolset-Resolution bei unklarem Zustand
+# (fehlende/korrupte/nicht-parsbare Config) auf die LEERE allowlist inkl.
+# MCP-Suppression ("no_mcp"-Semantik) zurueckfaellt -- NIE auf das volle Toolset.
+# Hintergrund: die api_server-Plattform ist die untrusted Voice-Bahn (STT = P10);
+# ein fail-open-Fallback waere RCE-Flaeche (terminal/execute_code/write_file/
+# delegate_task/browser_*). Bewusst NUR api_server als Default-Mitglied -- ein
+# globaler fail-closed-Schalter (ueber api_server hinaus, z.B. Discord) ist
+# owner-gegatet. Dieser Marker traegt den Reapply-Backstop nach `hermes update`
+# (s. /srv/services/jarvis/backstops/reapply_jarvis_failclosed_toolset.sh).
+FAIL_CLOSED_PLATFORMS = {"api_server"}
+
 
 # ─── Tool Categories (provider-aware configuration) ──────────────────────────
 # Maps toolset keys to their provider options. When a toolset is newly enabled,
@@ -1297,13 +1309,21 @@ def _get_platform_tools(
     toolset_names = platform_toolsets.get(platform)
 
     if toolset_names is None or not isinstance(toolset_names, list):
-        plat_info = PLATFORMS.get(platform)
-        if plat_info:
-            default_ts = plat_info["default_toolset"]
+        # jarvis: fail-closed toolset default (ADR-0031) -- REAPPLY-BACKSTOP MARKER.
+        # Fuer security-kritische Plattformen ist ein unklarer Config-Zustand
+        # (fehlend/null/Skalar/Dict durch korruptes YAML) KEIN Grund, das volle
+        # Toolset zu laden -- sondern der leere Voice-Boden (no_mcp). Schliesst den
+        # fail-OPEN-Kern (Befund #1): kein RCE-Fallback in der untrusted Voice-Bahn.
+        if platform in FAIL_CLOSED_PLATFORMS:
+            toolset_names = ["no_mcp"]
         else:
-            # Plugin platform — derive toolset name from platform key
-            default_ts = f"hermes-{platform}"
-        toolset_names = [default_ts]
+            plat_info = PLATFORMS.get(platform)
+            if plat_info:
+                default_ts = plat_info["default_toolset"]
+            else:
+                # Plugin platform — derive toolset name from platform key
+                default_ts = f"hermes-{platform}"
+            toolset_names = [default_ts]
 
     # YAML may parse bare numeric names (e.g. ``12306:``) as int.
     # Normalise to str so downstream sorted() never mixes types.
@@ -1510,15 +1530,31 @@ def _get_platform_tools(
         if isinstance(server_cfg, dict)
         and _parse_enabled_flag(server_cfg.get("enabled", True), default=True)
     }
+    # jarvis: fail-closed toolset default (ADR-0031) -- REAPPLY-BACKSTOP MARKER.
+    # MCP suppression spans BOTH decision sites below. For FAIL_CLOSED_PLATFORMS we
+    # suppress MCP on EVERY path -- not only when the "no_mcp" sentinel is present.
+    # This closes Befund #2 in its general form: a bare ``[]`` OR any non-empty list
+    # that resolves to zero configurable toolsets (e.g. an unknown name) would
+    # otherwise still pull every globally enabled MCP server into the untrusted Voice
+    # turn. Both sites branch on the same ``_suppress_mcp`` flag so they cannot drift.
+    # Abweichung vom Plan-Matrix-Sollwert (vermerkt, ADR-0031 §G): bei einem
+    # explizit gelisteten UNBEKANNTEN Namen (z.B. ["does_not_exist"]) erwartet die
+    # Matrix [] -- Lage 1 gibt hier den harmlosen Phantom-Namen zurueck (resolve_toolset
+    # -> 0 echte Tools, MCP unterdrueckt, kein forbidden_floor). Literales Clampen
+    # EXPLIZITER Configs ist bewusst Lage 2 (Boot-Wrapper Hash-Refuse-to-boot): jede
+    # Abweichung von der gepinnten allowlist (auch ["terminal"]) erzeugt einen
+    # Hash-Mismatch -> Container bootet nicht. Lage 1 = Fallback + MCP-Suppression,
+    # nicht Capability-Clamping expliziter Configs (intendiertes Passthrough upstream).
+    suppress_mcp = ("no_mcp" in toolset_names) or (platform in FAIL_CLOSED_PLATFORMS)
     # Allow "no_mcp" sentinel to opt out of all MCP servers for this platform
-    if "no_mcp" in toolset_names:
+    if suppress_mcp:
         explicit_mcp_servers = set()
         enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers - {"no_mcp"})
     else:
         explicit_mcp_servers = explicit_passthrough & enabled_mcp_servers
         enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers)
     if include_default_mcp_servers:
-        if explicit_mcp_servers or "no_mcp" in toolset_names:
+        if explicit_mcp_servers or suppress_mcp:
             enabled_toolsets.update(explicit_mcp_servers)
         else:
             enabled_toolsets.update(enabled_mcp_servers)
