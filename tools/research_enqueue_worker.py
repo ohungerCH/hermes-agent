@@ -433,7 +433,11 @@ def _build_research_prompt(norm: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 def _atomic_write_json(path: Path, payload: Any) -> None:
-    """Atomically write JSON to ``path`` (0o600). Raises on failure."""
+    """Atomically write JSON to ``path`` (0o644). The two callers (research index +
+    ``_progress.json``) are POLLED BY THE BRIDGE, which runs as a different UID
+    (10024) than the engine (10000); owner-only 0o600 would be unreadable across
+    the UID boundary. Content is bridge-re-redacted/scanned on read (ADR-0029), so
+    widening READ does not widen trust. Raises on failure."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent), suffix=".tmp", prefix=f".{path.name}_"
@@ -445,7 +449,7 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
         try:
-            os.chmod(path, 0o600)
+            os.chmod(path, 0o644)
         except OSError:
             pass
     except BaseException:
@@ -497,6 +501,52 @@ def _write_initial_progress(job_id: str) -> None:
         "created_at": _now().isoformat(),
     }
     _atomic_write_json(_cron_output_dir(job_id) / "_progress.json", progress)
+
+
+def _cron_output_root() -> Path:
+    """Root of the bridge-polled research output tree (cron/output)."""
+    return _hermes_home() / "cron" / "output"
+
+
+def normalize_research_output_perms(output_root: Optional[Path] = None) -> int:
+    """Keep the bridge-polled research output readable across the UID boundary.
+
+    The bridge (UID 10024) reads ``cron/output/{job_id}/*.md`` + ``_progress.json``
+    that the engine (UID 10000) writes -- but the cron/codex output writer produces
+    them 0600/0700 (owner-only), so the bridge cannot read them. This worker runs
+    as the engine UID (the OWNER), so it may relax the READ mode. DURABLE: called
+    every tick, so each new job's output is normalised regardless of how the codex
+    job wrote it (a one-time host chmod would NOT survive the next job).
+
+    Dirs -> 0o755, files -> 0o644 (read-only content; the bridge re-redacts + scans
+    every byte on read per ADR-0029, so widening READ here does NOT widen trust).
+    Idempotent (chmod only on mismatch); fail-soft (never raises). Returns the
+    number of paths adjusted.
+    """
+    base = output_root if output_root is not None else _cron_output_root()
+    if not base.exists():
+        return 0
+    adjusted = 0
+    try:
+        for root, _dirs, files in os.walk(base):
+            rp = Path(root)
+            try:
+                if (rp.stat().st_mode & 0o777) != 0o755:
+                    os.chmod(rp, 0o755)
+                    adjusted += 1
+            except OSError:
+                pass
+            for name in files:
+                fp = rp / name
+                try:
+                    if (fp.stat().st_mode & 0o777) != 0o644:
+                        os.chmod(fp, 0o644)
+                        adjusted += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return adjusted
 
 
 # ---------------------------------------------------------------------------

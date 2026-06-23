@@ -16539,11 +16539,20 @@ def _research_enqueue_scan_tick(tick_count: int, every: int = RESEARCH_SCAN_EVER
     if every <= 0 or tick_count % every != 0:
         return False
     try:
-        from tools.research_enqueue_worker import run_once as _research_run_once
+        from tools.research_enqueue_worker import (
+            run_once as _research_run_once,
+            normalize_research_output_perms as _research_normalize_perms,
+        )
         fired = _research_run_once()
         if fired:
             # Value-free: count only (job_ids are opaque; never topic/goal).
             logger.info("Research enqueue scan: fired %d job(s)", len(fired))
+        # Cross-UID handoff (CAVEAT 1): the codex job writes cron/output 0600/0700
+        # as the engine UID; the bridge polls it as a DIFFERENT UID. Normalise READ
+        # perms here every scan so each new job's result + _progress.json become
+        # bridge-readable (DURABLE — a one-time host chmod would not survive the
+        # next job). Content is re-redacted/scanned bridge-side (ADR-0029).
+        _research_normalize_perms()
     except Exception as e:  # fail-soft — a bad enqueue dir must not kill the ticker.
         logger.debug("Research enqueue scan error: %s", e)
     return True
