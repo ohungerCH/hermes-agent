@@ -41,12 +41,19 @@ Idempotency / cost protection (Spec §6.4 + Review #51-3/#51-4)
 The actuation-gate counts ``per_owner_per_hour`` ONCE, at intent time, on the
 BRIDGE write path. But this worker fires on EVERY file that lands in the enqueue
 dir — so the entire cost/loop story used to hang on the write-boundary of one
-directory. The worker now carries a **second, independent per-owner cost ceiling**
-(``_WORKER_RATE_CAP``, a deliberate duplicate of the gate value — NOT a registry
-read): before firing it counts the owner's fires inside a rolling 1h window from a
-small append-only ledger (``rate_ledger.jsonl``, ``{owner_key, fire_ts}`` only —
-NO Art.9) and refuses (``*.ratelimited``) at/over the cap. So a file that lands by
-any path other than the gated bridge is still capped.
+directory. The worker now carries TWO independent cost ceilings, both counted before firing
+from a small append-only ledger (``rate_ledger.jsonl``, ``{owner_key, fire_ts}``
+only — NO Art.9), both refusing (``*.ratelimited``) at/over the cap:
+  1. a **per-owner ceiling** (``_WORKER_RATE_CAP``, a deliberate duplicate of the
+     gate's ``per_owner_per_hour`` — NOT a registry read): the owner's own fires in
+     a rolling 1h window. Attributes cost fairly per owner.
+  2. a **global runaway ceiling** (``_WORKER_GLOBAL_RATE_CAP``): the fires across
+     ALL owner_keys in the same window. Because ``owner_key`` is read from the
+     enqueue file, a writer with direct enqueue-dir access (i.e. NOT the gated
+     bridge) could otherwise vary owner_key per file to keep every per-owner bucket
+     under the cap — the global ceiling is the real backstop against that.
+So a file that lands by any path other than the gated bridge is bounded BOTH per
+declared owner_key AND in aggregate.
 
 Idempotency: the worker claims a file by **atomically renaming it to
 ``*.processing`` BEFORE firing**, then to ``*.done`` on success / ``*.failed`` on
@@ -159,6 +166,11 @@ _DEFAULT_OWNER_KEY = "owner-primary"
 # ledger carries no Art.9 subject — separating the cost signal from the content
 # is what lets F3 and F4 coexist instead of contradicting.
 _WORKER_RATE_CAP = 6                       # mirrors gate per_owner_per_hour (independent).
+_WORKER_GLOBAL_RATE_CAP = 12               # runaway backstop across ALL owner_keys (2x per-owner).
+                                           # owner_key is file-controlled, so a non-bridge writer could
+                                           # vary it to dodge the per-owner cap; this bounds the aggregate
+                                           # regardless. Raise consciously when onboarding more owners
+                                           # (single-owner today: legit traffic stays in one bucket).
 _WORKER_RATE_WINDOW_SECONDS = 60 * 60      # rolling 1h window.
 _RATE_LEDGER_NAME = "rate_ledger.jsonl"    # under the enqueue dir (bridge-fed volume).
 
@@ -632,6 +644,23 @@ def _owner_fire_count(enqueue_dir: Path, owner_key: str, now_ts: float) -> int:
     return n
 
 
+def _global_fire_count(enqueue_dir: Path, now_ts: float) -> int:
+    """Count ALL fires (across every owner_key) inside the rolling rate window.
+    The global runaway backstop: owner_key is file-controlled, so the per-owner
+    count alone is dodgeable by a non-bridge writer varying owner_key; this
+    aggregate is not."""
+    floor = now_ts - _WORKER_RATE_WINDOW_SECONDS
+    n = 0
+    for rec in _read_ledger(enqueue_dir):
+        try:
+            ts = float(rec.get("fire_ts"))
+        except (TypeError, ValueError):
+            continue
+        if ts >= floor:
+            n += 1
+    return n
+
+
 def _append_ledger(enqueue_dir: Path, owner_key: str, now_ts: float) -> None:
     """Append ONE fire record (owner_key + fire_ts only — DLP: no Art.9). Atomic
     line append. Fail-soft: a ledger write failure never blocks the fired job."""
@@ -760,10 +789,12 @@ def process_one(path: Path) -> Optional[str]:
     be claimed (someone else has it).
 
     INDEPENDENT cost cap (Review #51-3): after the payload is normalised (so the
-    owner_key is known) and BEFORE firing, the owner's fires inside the rolling
-    window are counted from the ledger. At/over the cap the file is marked
-    ``*.ratelimited`` (terminal, no retry) and nothing is fired — a SECOND ceiling
-    that does not depend on the bridge's gate having counted it.
+    owner_key is known) and BEFORE firing, two ledger ceilings are checked — the
+    owner's own fires (``_WORKER_RATE_CAP``) AND the aggregate across all owner_keys
+    (``_WORKER_GLOBAL_RATE_CAP``, the runaway backstop, since owner_key is
+    file-controlled). At/over either cap the file is marked ``*.ratelimited``
+    (terminal, no retry) and nothing is fired — a SECOND ceiling that does not
+    depend on the bridge's gate having counted it.
     """
     path = Path(path)
     enqueue_dir = path.parent
@@ -795,6 +826,16 @@ def process_one(path: Path) -> Optional[str]:
             logger.warning(
                 "research enqueue: worker cost cap reached for owner=%s (cap=%d) — refused",
                 owner_key, _WORKER_RATE_CAP,
+            )
+            _finish(claimed, ok=False, outcome="ratelimited")
+            return None
+        # GLOBAL runaway backstop across ALL owner_keys. owner_key is file-controlled,
+        # so the per-owner cap above is dodgeable by a non-bridge writer varying it;
+        # this aggregate ceiling is not.
+        if _global_fire_count(enqueue_dir, now_ts) >= _WORKER_GLOBAL_RATE_CAP:
+            logger.warning(
+                "research enqueue: GLOBAL worker cost ceiling reached (cap=%d) — refused",
+                _WORKER_GLOBAL_RATE_CAP,
             )
             _finish(claimed, ok=False, outcome="ratelimited")
             return None

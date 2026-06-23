@@ -16505,6 +16505,50 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
+# How often (in cron ticks) the research enqueue worker scans RESEARCH_ENQUEUE_DIR.
+# At the default 60s tick interval this is once per minute — the enqueue files are
+# written by the bridge AFTER an owner confirms an inapp_tap, so a one-minute pickup
+# latency is acceptable and keeps the scan off the hot path.
+RESEARCH_SCAN_EVERY = 1  # ticks
+
+
+def _research_enqueue_scan_tick(tick_count: int, every: int = RESEARCH_SCAN_EVERY) -> bool:
+    """Periodically drive the file-triggered research enqueue worker (B3).
+
+    This is the periodic TRIGGER for ``tools.research_enqueue_worker.run_once`` —
+    the worker itself deliberately ships only ``run_once`` / ``process_one`` and no
+    scheduler of its own (its integration boundary). The idiomatic engine-line
+    cadence is the in-process cron ticker (the same thread that already piggy-backs
+    the curator / cache cleanup / paste sweep on ``tick_count``), so a separate
+    systemd timer or system cron entry is NOT introduced — one fewer moving part,
+    and the worker runs in the same gateway process / HERMES_HOME as the cron
+    scheduler it ultimately fires jobs into.
+
+    ``run_once`` resolves its directory from ``RESEARCH_ENQUEUE_DIR`` (or the
+    default) and is a no-op on a missing/empty dir, so an env-unset deploy makes
+    this hook inert — env-unset is the de-facto kill switch; no separate engine-side
+    enable flag is needed. The worker hard-codes the web-only / Codex / repeat=1
+    lane pins itself (Threat F); nothing about the lane is decided here.
+
+    Returns ``True`` when a scan was due this tick (so the loop / tests can observe
+    the cadence), ``False`` otherwise. Fail-soft: any worker error is swallowed and
+    logged at debug so a transient enqueue-dir problem never kills the ticker. NEVER
+    logs topic/goal — the worker is responsible for its own DLP and never returns
+    raw assignment text to this caller.
+    """
+    if every <= 0 or tick_count % every != 0:
+        return False
+    try:
+        from tools.research_enqueue_worker import run_once as _research_run_once
+        fired = _research_run_once()
+        if fired:
+            # Value-free: count only (job_ids are opaque; never topic/goal).
+            logger.info("Research enqueue scan: fired %d job(s)", len(fired))
+    except Exception as e:  # fail-soft — a bad enqueue dir must not kill the ticker.
+        logger.debug("Research enqueue scan error: %s", e)
+    return True
+
+
 def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
     """
     Background thread that ticks the cron scheduler at a regular interval.
@@ -16595,6 +16639,12 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
                 )
             except Exception as e:
                 logger.debug("Curator tick error: %s", e)
+
+        # Research enqueue worker (B3) — piggy-back on the cron ticker so the
+        # file-triggered Codex web-research jobs get picked up periodically without
+        # a separate systemd timer / system cron. Inert when RESEARCH_ENQUEUE_DIR
+        # is unset (no-op on a missing dir) and fully fail-soft.
+        _research_enqueue_scan_tick(tick_count)
 
         stop_event.wait(timeout=interval)
     logger.info("Cron ticker stopped")

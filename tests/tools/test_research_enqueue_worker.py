@@ -588,6 +588,30 @@ class TestWorkerCostCap:
             res = process_one(p)
         assert res == "jB"
 
+    def test_global_ceiling_caps_across_owners(self, _isolate_home, caplog):
+        # The per-owner cap is dodgeable by varying owner_key (file-controlled);
+        # the GLOBAL ceiling must still bite. Fire the global cap across DISTINCT
+        # owner_keys (one each, so no per-owner bucket is ever near its own cap),
+        # then one more -> refused by the global ceiling.
+        for i in range(rw._WORKER_GLOBAL_RATE_CAP):
+            p = _write_enqueue(_isolate_home, _enqueue(topic=f"G{i}", owner_key=f"owner-{i}"),
+                               fname=f"g{i}.json")
+            with patch.object(rw, "cronjob", return_value=_ok_cron_return(f"jg-{i}")):
+                assert process_one(p) is not None
+        # Every per-owner bucket holds exactly 1 (< _WORKER_RATE_CAP), yet the
+        # aggregate sits at the global ceiling.
+        enq = _isolate_home / "enqueue"
+        assert rw._global_fire_count(enq, rw._now_ts()) == rw._WORKER_GLOBAL_RATE_CAP
+        p = _write_enqueue(_isolate_home, _enqueue(topic="OVER-GLOBAL", owner_key="owner-fresh"),
+                           fname="over_global.json")
+        with caplog.at_level(logging.WARNING):
+            with patch.object(rw, "cronjob", return_value=_ok_cron_return("never")) as m:
+                res = process_one(p)
+        assert res is None
+        m.assert_not_called()  # global ceiling blocks BEFORE firing.
+        assert (p.parent / (p.name + ".processing.ratelimited")).exists()
+        assert "GLOBAL worker cost ceiling reached" in caplog.text
+
     def test_old_fires_outside_window_do_not_count(self, _isolate_home):
         # Pre-seed the ledger with cap entries that are OLDER than the window ->
         # they must not block a fresh fire.
