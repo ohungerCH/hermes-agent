@@ -1151,6 +1151,63 @@ class TestRunJobSessionPersistence:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["enabled_toolsets"] == ["terminal"]
 
+    # ------------------------------------------------------------------
+    # #60: per-job reasoning_effort overrides config.yaml; absent → config.
+    # This is the LOAD-BEARING half of the reasoning_effort pin: it proves the
+    # field is actually CONSUMED at run time (job.get("reasoning_effort") ->
+    # parse_reasoning_effort -> AIAgent(reasoning_config=...)), and that the
+    # change is ADDITIVE — a job that does not pin it keeps the config.yaml
+    # behaviour byte-for-byte. (The worker-side tests in
+    # tests/tools/test_research_enqueue_worker.py cover the enqueue->cronjob
+    # half; this closes the scheduler half so edit 4 is not ship-silent.)
+    # ------------------------------------------------------------------
+
+    def test_run_job_per_job_reasoning_effort_overrides_config(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "agent:\n  reasoning_effort: low\n", encoding="utf-8",
+        )
+        job = {
+            "id": "effort-job",
+            "name": "test",
+            "prompt": "hello",
+            "reasoning_effort": "xhigh",   # per-job pin must WIN over config.
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        # parse_reasoning_effort("xhigh") -> {"enabled": True, "effort": "xhigh"}.
+        assert kwargs["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+
+    def test_run_job_without_reasoning_effort_uses_config(self, tmp_path):
+        """ADDITIVE invariant: a job that does NOT pin reasoning_effort (every
+        pre-#60 job) falls through to config.yaml exactly as before."""
+        (tmp_path / "config.yaml").write_text(
+            "agent:\n  reasoning_effort: low\n", encoding="utf-8",
+        )
+        job = {
+            "id": "no-effort-job",
+            "name": "test",
+            "prompt": "hello",
+            # no reasoning_effort key at all.
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        # Config value applied unchanged — proves the override is additive.
+        assert kwargs["reasoning_config"] == {"enabled": True, "effort": "low"}
+
     def test_run_job_empty_response_returns_empty_not_placeholder(self, tmp_path):
         """Empty final_response should stay empty for delivery logic (issue #2234).
 

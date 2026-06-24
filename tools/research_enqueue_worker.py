@@ -19,13 +19,23 @@ of ``.media-d4f-worktree/tools/research_tool.py`` lines 19-26)
 The spawned research agent MUST only ever have read/web capability. The job's
 toolset (``["web"]``), model pin (``openai-codex`` / ``gpt-5.4``) and ``repeat=1``
 are **HARD-CODED here** and are NEVER read from the enqueue file, the LLM, STT, or
-any other input. The enqueue file carries NONE of these fields; even if a tampered
-file did carry them, this worker ignores them. The **load-bearing escalation
-guard is** ``enabled_toolsets=["web"]`` — if the spawned agent's toolset could be
-chosen by input, a prompt-injection could escalate *research* into *action*, which
-the lane makes structurally impossible. (The intended fifth pin ``profile`` /
-``codex-recherche`` cannot be wired on the current deploy line — see the
-``_RESEARCH_PROFILE`` constant for the honest limitation.)
+any other input. The enqueue file carries NONE of these LANE-DEFINING fields; even
+if a tampered file did carry them, this worker ignores them. The **load-bearing
+escalation guard is** ``enabled_toolsets=["web"]`` — if the spawned agent's toolset
+could be chosen by input, a prompt-injection could escalate *research* into
+*action*, which the lane makes structurally impossible. (The intended fifth pin
+``profile`` / ``codex-recherche`` cannot be wired on the current deploy line — see
+the ``_RESEARCH_PROFILE`` constant for the honest limitation.)
+
+THE ONE INPUT-HONORED FIELD (#60): ``reasoning_effort`` is the SOLE field the
+worker reads from the enqueue file and forwards to ``cronjob()``. It is
+**lane-NEUTRAL**: it controls only the Codex *thinking depth* (none/minimal/low/
+medium/high/xhigh) and grants ZERO additional capability — the spawned agent stays
+web-only no matter what effort is requested. It is enum-validated against
+``VALID_REASONING_EFFORTS`` and falls back to the ``high`` default for any
+unrecognised / absent value, so a tampered string (e.g. ``"rm -rf"``) can never
+reach the provider as anything but a clamped enum. Widening *thinking* is not
+widening the *bahn*; the lane-defining pins above remain input-ignored.
 
 Recursion lock (Spec §6.1) — what it concretely IS here
 -------------------------------------------------------
@@ -125,9 +135,19 @@ _RESEARCH_MODEL_NAME = "gpt-5.4"
 # actually honouring it at run time — both are engine-side, out of B3 worker-file
 # scope, and governed by the #38 engine-fork line. Passing it to ``cronjob()``
 # today would raise ``TypeError`` and fail every job, so it is intentionally NOT
-# passed below. Functionally neutral on this line (auth/reasoning come from the
-# running gateway's HERMES_HOME, routed by the provider/model pins that ARE wired).
+# passed below. Functionally neutral on this line for AUTH (Codex auth comes from
+# the running gateway's HERMES_HOME, routed by the provider/model pins that ARE
+# wired). The REASONING half of what this profile was meant to carry is now wired
+# independently and explicitly via the per-job ``reasoning_effort`` pin (#60) below,
+# so thinking depth no longer depends on this (unwired) profile.
 _RESEARCH_PROFILE = "codex-recherche"
+
+# Per-job reasoning effort (#60). This is the ONE field the worker honors from the
+# enqueue file — see the module SECURITY INVARIANT. Lane-neutral: it sets only the
+# Codex thinking depth, never a capability. Default ``high`` (the task/design
+# contract default; note this differs from the unwired _RESEARCH_PROFILE's xhigh).
+# Validated against hermes_constants.VALID_REASONING_EFFORTS; anything else -> default.
+_DEFAULT_REASONING_EFFORT = "high"
 
 # One-shot job: run once, then done. Prevents self-reschedule (Spec §6.4).
 _RESEARCH_REPEAT = 1
@@ -136,8 +156,22 @@ _RESEARCH_REPEAT = 1
 # up on the next tick rather than racing a same-instant comparison).
 _FIRE_DELAY_SECONDS = 5
 
-# The enqueue schema this worker accepts. Anything else is quarantined.
-_ENQUEUE_SCHEMA = "research.enqueue.v1"
+# The enqueue schemas this worker accepts. Anything else is quarantined.
+#
+# v1 is the original shape. v2 is ADDITIVE (#60): it carries the lane-neutral
+# ``reasoning_effort`` enum as an extra sibling field — every v1 field keeps the
+# same meaning. The bridge enqueue writer emits v2 (jarvis-bridge-service.mjs
+# enqueueResearchJob); a v1 file (older bridge / hand-written) is still valid.
+# Accepting BOTH keeps the contract backward-compatible in both directions:
+# the worker reads ``reasoning_effort`` when present and clamps it to a known
+# enum (see ``_normalise_reasoning_effort``), so a v1 file simply falls back to
+# the ``high`` default. This set is the ONLY structural gate on schema; an
+# unknown/absent schema is still fail-closed (quarantined).
+_ENQUEUE_SCHEMA = "research.enqueue.v1"  # v1 base shape (kept as the canonical name).
+_ACCEPTED_ENQUEUE_SCHEMAS = frozenset({
+    _ENQUEUE_SCHEMA,            # v1 base
+    "research.enqueue.v2",      # #60 additive (v1 fields + reasoning_effort sibling)
+})
 
 # Enqueue directory default (overridable for the bridge mount / tests).
 _DEFAULT_ENQUEUE_DIR = "/var/lib/jarvis-research/enqueue"
@@ -272,6 +306,23 @@ def _clamp_time_budget(raw: Any) -> Optional[int]:
     return raw
 
 
+def _normalise_reasoning_effort(raw: Any) -> str:
+    """Validate the ONE input-honored field (#60): the Codex thinking depth.
+
+    Lane-neutral — it sets only reasoning depth, never a capability. Accepted
+    values are ``hermes_constants.VALID_REASONING_EFFORTS``. ANY other value
+    (absent, wrong type, unknown string, even an injection attempt like
+    ``"rm -rf"``) falls back to ``_DEFAULT_REASONING_EFFORT`` (``high``), so a
+    tampered file can never reach the provider as anything but a clamped enum.
+    """
+    from hermes_constants import VALID_REASONING_EFFORTS
+    if isinstance(raw, str):
+        candidate = raw.strip().lower()
+        if candidate in VALID_REASONING_EFFORTS:
+            return candidate
+    return _DEFAULT_REASONING_EFFORT
+
+
 def _normalise_enqueue(data: Dict[str, Any]) -> Dict[str, Any]:
     """Validate + normalise an enqueue payload into the fields the prompt uses.
 
@@ -280,8 +331,11 @@ def _normalise_enqueue(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(data, dict):
         raise ValueError("enqueue payload is not an object")
-    if data.get("schema") != _ENQUEUE_SCHEMA:
-        raise ValueError(f"unexpected schema (want {_ENQUEUE_SCHEMA!r})")
+    if data.get("schema") not in _ACCEPTED_ENQUEUE_SCHEMAS:
+        # fail-closed: an unknown/absent schema is quarantined. Message stays
+        # free of raw topic/goal; it lists only the accepted schema names.
+        accepted = ", ".join(sorted(_ACCEPTED_ENQUEUE_SCHEMAS))
+        raise ValueError(f"unexpected schema (accepted: {accepted})")
 
     topic = data.get("topic")
     if not isinstance(topic, str) or not topic.strip():
@@ -315,6 +369,8 @@ def _normalise_enqueue(data: Dict[str, Any]) -> Dict[str, Any]:
         "language": language,
         "time_budget_minutes": _clamp_time_budget(data.get("time_budget_minutes")),
         "owner_key": owner_key,
+        # #60: the ONE input-honored, lane-neutral field (thinking depth only).
+        "reasoning_effort": _normalise_reasoning_effort(data.get("reasoning_effort")),
     }
 
 
@@ -559,12 +615,16 @@ def _fire_research_job(norm: Dict[str, Any]) -> Optional[str]:
     Returns the cron ``job_id`` on success, or ``None`` on a soft failure (cron
     unavailable / create rejected). NEVER logs topic/goal.
 
-    SECURITY INVARIANT: the four wired pin kwargs below are module literals, NOT
-    derived from ``norm`` / the enqueue file. The load-bearing escalation guard is
-    ``enabled_toolsets=["web"]`` (research can never become action). ``profile`` is
-    the intended fifth pin but is NOT passed: the deploy-line ``cronjob()`` has no
-    such parameter (see ``_RESEARCH_PROFILE`` comment). The kwargs are passed last
-    so they cannot be shadowed by anything upstream.
+    SECURITY INVARIANT: the four LANE-DEFINING pin kwargs below are module
+    literals, NOT derived from ``norm`` / the enqueue file. The load-bearing
+    escalation guard is ``enabled_toolsets=["web"]`` (research can never become
+    action). ``profile`` is the intended fifth pin but is NOT passed: the
+    deploy-line ``cronjob()`` has no such parameter (see ``_RESEARCH_PROFILE``
+    comment). ``reasoning_effort`` (#60) IS derived from ``norm`` — it is the one
+    input-honored field, but it is lane-NEUTRAL (thinking depth only) and was
+    already enum-clamped by ``_normalise_reasoning_effort`` to a known effort
+    level, so it cannot widen the bahn. The kwargs are passed last so they cannot
+    be shadowed by anything upstream.
     """
     title = _make_title(norm["topic"])
     prompt = _build_research_prompt(norm)
@@ -578,6 +638,7 @@ def _fire_research_job(norm: Dict[str, Any]) -> Optional[str]:
         enabled_toolsets=list(_RESEARCH_TOOLSET),    # hard-coded ["web"] (copy)
         model=_RESEARCH_MODEL_NAME,                  # hard-coded gpt-5.4
         provider=_RESEARCH_PROVIDER,                 # hard-coded openai-codex
+        reasoning_effort=norm["reasoning_effort"],   # #60: enum-clamped, lane-neutral
         # profile (codex-recherche) intentionally NOT passed — unsupported by the
         # deploy-line cronjob() signature; would TypeError. See module constant.
         # deliver intentionally omitted (PULL model: the .md is the truth).

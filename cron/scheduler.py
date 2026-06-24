@@ -1606,9 +1606,24 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except Exception:
             pass
 
-        # Reasoning config from config.yaml
+        # Reasoning config: prefer a per-job override, else config.yaml (#60).
+        # ADDITIVE-ONLY invariant: a job WITHOUT reasoning_effort (job.get(...) is
+        # None/"" — the case for every pre-#60 job and every job that does not pin
+        # it) falls straight through to the config.yaml value below, so existing
+        # cron jobs keep today's behaviour byte-for-byte.
+        # On a per-job value: parse_reasoning_effort() enum-validates and never
+        # crashes. NOTE the precise failure mode for an INVALID non-empty string:
+        # it returns None -> reasoning_config=None -> AIAgent's built-in default
+        # (NOT the config.yaml value — once a non-empty per-job string is chosen,
+        # config.yaml is no longer consulted). The wired research path can't hit
+        # this (the worker enum-clamps reasoning_effort upstream before it is ever
+        # stored), so on the only writer today the per-job value is always valid.
         from hermes_constants import parse_reasoning_effort
-        effort = str(_cfg.get("agent", {}).get("reasoning_effort", "")).strip()
+        _job_effort = job.get("reasoning_effort")
+        if isinstance(_job_effort, str) and _job_effort.strip():
+            effort = _job_effort.strip()
+        else:
+            effort = str(_cfg.get("agent", {}).get("reasoning_effort", "")).strip()
         reasoning_config = parse_reasoning_effort(effort)
 
         # Prefill messages from env or config.yaml. The top-level
