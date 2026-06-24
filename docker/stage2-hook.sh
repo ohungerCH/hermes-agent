@@ -234,6 +234,42 @@ if [ -d "$HERMES_HOME/cron" ]; then
     chown -R hermes:hermes "$HERMES_HOME/cron" 2>/dev/null || true
 fi
 
+# --- Research-Enqueue cross-UID handoff (#65 P1, deploy-durabel) ---
+# Die Bridge (UID 10024) SCHREIBT cron/enqueue/<job>.json; die Engine (UID 10000) LIEST/
+# claimt. Der `chown -R cron`-Block oben setzt cron/enqueue bei jedem Boot auf 10000-only
+# zurueck -> die Bridge EACCESt. Fix ohne Image-Paket (kein `acl` im Image): eine dedizierte
+# shared-GID besitzt cron/enqueue mit setgid (2770) -> beide schreiben/lesen via Gruppe,
+# niemand sonst (KEIN world-writable). MUSS NACH dem `chown -R cron` oben laufen.
+#
+# Die Bridge erhaelt die GID per `group_add` (compose.bridge.yaml) und behaelt ihre PRIMAERe
+# GID 10024 -- ihre uebrigen Volume-Writes (bridge_registry) bleiben unveraendert. hermes
+# (Engine-Runtime) wird hier Mitglied der Gruppe; setgid sorgt dafuer, dass NEUE Dateien in
+# cron/enqueue die Gruppe erben (die Engine kann von der Bridge geschriebene Dateien
+# umbenennen/lesen und umgekehrt).
+JARVIS_RESEARCH_GID="${JARVIS_RESEARCH_GID:-10240}"   # dedizierte GID, entkoppelt von der Bridge-UID
+JARVIS_RESEARCH_GROUP="jarvis-research"
+# Gruppe sicherstellen (idempotent; -o erlaubt nicht-eindeutige GID, falls schon belegt).
+if ! getent group "$JARVIS_RESEARCH_GID" >/dev/null 2>&1; then
+    groupadd -o -g "$JARVIS_RESEARCH_GID" "$JARVIS_RESEARCH_GROUP" 2>/dev/null \
+        || echo "[stage2] Warning: groupadd $JARVIS_RESEARCH_GROUP ($JARVIS_RESEARCH_GID) failed; enqueue handoff may EACCES"
+fi
+# hermes (Engine-Runtime) der Gruppe hinzufuegen, damit die Engine cron/enqueue lesen darf.
+research_grp_name="$(getent group "$JARVIS_RESEARCH_GID" 2>/dev/null | cut -d: -f1)"
+if [ -n "$research_grp_name" ]; then
+    if ! id -G hermes 2>/dev/null | tr ' ' '\n' | grep -qx "$JARVIS_RESEARCH_GID"; then
+        usermod -aG "$research_grp_name" hermes 2>/dev/null \
+            || echo "[stage2] Warning: usermod -aG $research_grp_name hermes failed"
+    fi
+fi
+# cron/enqueue mit shared-GID + setgid (2770) anlegen/setzen -- deterministisch bei JEDEM Boot,
+# NACH dem clobbernden `chown -R cron`. Loest zugleich den Subpath-Mount-CAVEAT (cron/enqueue
+# muss existieren, sonst scheitert der Bridge-`up`).
+mkdir -p "$HERMES_HOME/cron/enqueue"
+chgrp "$JARVIS_RESEARCH_GID" "$HERMES_HOME/cron/enqueue" 2>/dev/null \
+    || echo "[stage2] Warning: chgrp $JARVIS_RESEARCH_GID cron/enqueue failed"
+chmod 2770 "$HERMES_HOME/cron/enqueue" 2>/dev/null \
+    || echo "[stage2] Warning: chmod 2770 cron/enqueue failed"
+
 # Reset ownership of hermes-owned top-level state files on every boot.
 # The targeted data-volume chown above only covers hermes-owned
 # *subdirectories*; loose state files living directly under $HERMES_HOME
