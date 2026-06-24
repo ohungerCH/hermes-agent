@@ -91,6 +91,15 @@ RUN set -eu; \
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
 RUN useradd -u 10000 -m -d /opt/data hermes
 
+# #65 P1: dedizierte Research-GID + Engine-Mitgliedschaft zur BUILD-Zeit anlegen.
+# Das Rootfs ist zur Laufzeit read-only -> groupadd/usermod im stage2-Hook scheitern
+# (groupadd kann /etc/group nicht schreiben). Hier zur Build-Zeit ist /etc schreibbar.
+# Der stage2-Hook macht zur Laufzeit dann nur noch chgrp 10240 + chmod 2770 auf das
+# VOLUME-Verzeichnis cron/enqueue (writable) -> setgid greift, hermes ist schon Mitglied,
+# Cross-UID-Handoff Bridge(10024 via group_add)->Engine(10000) ist fresh-volume-durabel.
+# Der Wert MUSS zu JARVIS_RESEARCH_GID (stage2) + group_add der Bridge passen (SSOT 10240).
+RUN groupadd -g 10240 jarvis-research && usermod -aG jarvis-research hermes
+
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 
 # Node 22 LTS: copy the node binary plus the bundled npm + corepack JS
