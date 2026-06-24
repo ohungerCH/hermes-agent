@@ -638,7 +638,14 @@ def _fire_research_job(norm: Dict[str, Any]) -> Optional[str]:
         enabled_toolsets=list(_RESEARCH_TOOLSET),    # hard-coded ["web"] (copy)
         model=_RESEARCH_MODEL_NAME,                  # hard-coded gpt-5.4
         provider=_RESEARCH_PROVIDER,                 # hard-coded openai-codex
-        reasoning_effort=norm["reasoning_effort"],   # #60: enum-clamped, lane-neutral
+        # reasoning_effort (#60) TEMPORAER NICHT uebergeben (2026-06-24): "high"/"xhigh"
+        # lassen Codex' Stream lange stumm "denken" -> der "12s keine Events -> Reconnect"-
+        # Watchdog killt den Stream mitten im Denken -> Broken-Pipe-Endlosschleife (Job
+        # haengt ewig auf phase=running, kein Ergebnis). Bis der Reconnect-Watchdog langes
+        # Denken toleriert, faellt die Recherche bewusst auf den bewaehrten Provider-Default
+        # (config '' = letztnachts funktionierendes Verhalten) zurueck -- unabhaengig davon,
+        # was die App im ui_hints-Selektor schickt. norm["reasoning_effort"] bleibt dormant
+        # verdrahtet; HIER reaktivieren NACH dem Watchdog-Fix (Folge-Task der #60).
         # profile (codex-recherche) intentionally NOT passed — unsupported by the
         # deploy-line cronjob() signature; would TypeError. See module constant.
         # deliver intentionally omitted (PULL model: the .md is the truth).
