@@ -617,6 +617,28 @@ class TestBridgePolledOutputs:
         index = json.loads((_isolate_home / "cron" / "research_index.json").read_text())
         assert {e["job_id"] for e in index} == {"j1", "j2"}
 
+    def test_index_inode_stable_across_writes(self, _isolate_home):
+        # CAVEAT-3 / #74 regression: the index MUST be rewritten IN PLACE (same inode),
+        # never via atomic rename. The bridge subpath-mounts research_index.json as a
+        # SINGLE FILE -> a new inode per write orphans the bridge's pinned view (stale,
+        # no FERTIG-announce until a bridge recreate). This guards against someone
+        # swapping _inplace_write_json back to _atomic_write_json (os.replace).
+        index_file = _isolate_home / "cron" / "research_index.json"
+        p1 = _write_enqueue(_isolate_home, _enqueue(topic="A"), fname="a.json")
+        p2 = _write_enqueue(_isolate_home, _enqueue(topic="B"), fname="b.json")
+        with patch.object(rw, "cronjob", side_effect=[_ok_cron_return("j1"), _ok_cron_return("j2")]):
+            process_one(p1)
+            ino_after_first = index_file.stat().st_ino
+            process_one(p2)
+            ino_after_second = index_file.stat().st_ino
+        assert ino_after_first == ino_after_second, (
+            "research_index.json was rewritten with a NEW inode (atomic rename?) -- this "
+            "breaks the bridge's single-file mount (CAVEAT 3 / #74)"
+        )
+        # Sanity: the second write really landed (both jobs present).
+        index = json.loads(index_file.read_text())
+        assert {e["job_id"] for e in index} == {"j1", "j2"}
+
 
 # ---------------------------------------------------------------------------
 # 8. run_once over a directory: fail-isolated batch.

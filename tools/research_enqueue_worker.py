@@ -516,6 +516,32 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
         raise
 
 
+def _inplace_write_json(path: Path, payload: Any) -> None:
+    """In-place JSON write (truncate+write, SAME inode) -- used ONLY for the research
+    index. CAVEAT-3 / Task #74: the bridge subpath-mounts ``research_index.json`` as a
+    SINGLE FILE, which pins the inode at container-mount time. An atomic rename
+    (``os.replace``, as in ``_atomic_write_json``) creates a NEW inode on every write and
+    orphans the bridge's pinned view -> the bridge goes stale and never sees newly
+    completed jobs (no FERTIG-announce until a bridge recreate). Writing in place keeps
+    the inode stable so the bridge's single-file mount tracks updates. Safe here because:
+    (a) single writer -- the research worker runs ``--workers 1`` (MANDATORY, Task #42),
+    so no concurrent-write corruption; (b) the bridge's ``readResearchIndex`` is fail-soft
+    on a partial read (returns [] + retries the 15s poll; the announce is idempotent via
+    announcedJobIds), so the only tradeoff vs the atomic rename -- a sub-ms truncate window
+    -- is harmless. ``_progress.json`` etc. KEEP ``_atomic_write_json`` (they live in the
+    bridge's DIRECTORY mount, where a rename is invisible). Raises on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(payload, ensure_ascii=False, indent=2)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.chmod(path, 0o644)
+    except OSError:
+        pass
+
+
 def _load_index() -> List[Dict[str, Any]]:
     """Load the research index list. Returns [] on any error (fail-soft)."""
     try:
@@ -543,7 +569,9 @@ def _record_index_entry(job_id: str, title: str, output_mode: str) -> None:
         "output_mode": output_mode,
         "created_at": _now().isoformat(),
     })
-    _atomic_write_json(_index_path(), entries)
+    # CAVEAT-3 / #74: in-place (NOT atomic rename) so the bridge's single-file mount of
+    # research_index.json keeps tracking updates (a rename would orphan its pinned inode).
+    _inplace_write_json(_index_path(), entries)
 
 
 def _write_initial_progress(job_id: str) -> None:
