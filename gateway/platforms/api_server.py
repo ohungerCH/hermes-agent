@@ -116,7 +116,7 @@ _TRUSTED_SURFACE_GERMAN_MEMORY_REQUEST_MARKERS = (
     "kannst du dir merken",
     "speichere",
     "speicher das",
-    "erinnerung",
+    "erinnere dich",
 )
 _TRUSTED_SURFACE_ENGLISH_MEMORY_REQUEST_MARKERS = (
     "remember this",

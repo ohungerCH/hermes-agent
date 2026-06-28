@@ -327,6 +327,38 @@ async def test_trusted_surface_memory_request_is_answered_honestly_without_model
 
 
 @pytest.mark.asyncio
+async def test_trusted_surface_memory_meta_question_still_reaches_model(
+    trusted_surface_adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "trusted-memory-meta-session",
+        "trusted_surface",
+        user_id="user:owner1",
+        model="test-model",
+    )
+    mock_run = AsyncMock(
+        return_value=(
+            {"final_response": "Das ist eine Meta-Erklärung.", "session_id": session_id},
+            {"total_tokens": 5},
+        )
+    )
+    app = _create_session_app(trusted_surface_adapter)
+    with patch.object(trusted_surface_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/trusted-surface/sessions/{session_id}/chat",
+                json={"message": "Wie funktioniert deine Erinnerung in diesem Modus?"},
+                headers={"Authorization": f"Bearer {_trusted_surface_token()}"},
+            )
+            assert resp.status == 200
+            payload = await resp.json()
+
+    mock_run.assert_awaited_once()
+    assert payload["message"]["content"] == "Das ist eine Meta-Erklärung."
+
+
+@pytest.mark.asyncio
 async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeypatch):
     """API-server request sessions should reach tools and terminal subprocess env."""
     monkeypatch.setenv("HERMES_SESSION_ID", "stale-session")
