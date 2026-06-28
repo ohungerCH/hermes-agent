@@ -34,6 +34,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.trusted_surface import TrustedSurfaceAuthError
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +386,31 @@ class TestAuth:
         assert result is not None
         assert result.status == 401
 
+    def test_trusted_surface_credential_does_not_satisfy_api_server_auth(self):
+        config = PlatformConfig(
+            enabled=True,
+            extra={
+                "key": "sk-untrusted",
+                "trusted_surface": {
+                    "enabled": True,
+                    "credential": "ts-separate",
+                    "principal_id": "principal-owner",
+                    "role": "owner",
+                    "workspace_id": "private",
+                    "tenant_id": "tenant-private",
+                    "user_id": "user-owner",
+                    "owner_id": "owner-root",
+                    "device_id": "device-phone",
+                },
+            },
+        )
+        adapter = APIServerAdapter(config)
+        mock_request = MagicMock()
+        mock_request.headers = {"Authorization": "Bearer ts-separate"}
+        result = adapter._check_auth(mock_request)
+        assert result is not None
+        assert result.status == 401
+
 
 # ---------------------------------------------------------------------------
 # Helpers for HTTP tests
@@ -690,6 +716,177 @@ class TestCapabilitiesEndpoint:
             assert authed.status == 200
             data = await authed.json()
             assert data["auth"]["required"] is True
+
+    @pytest.mark.asyncio
+    async def test_capabilities_advertise_dark_trusted_surface_seam(self):
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "key": "sk-untrusted",
+                    "trusted_surface": {
+                        "enabled": True,
+                        "credential": "ts-separate",
+                        "principal_id": "principal-owner",
+                        "role": "owner",
+                        "workspace_id": "private",
+                        "tenant_id": "tenant-private",
+                        "user_id": "user-owner",
+                        "owner_id": "owner-root",
+                        "device_id": "device-phone",
+                        "allowed_toolsets": ["terminal", "web"],
+                        "allowed_capabilities": ["memory.read", "skills.read"],
+                    },
+                },
+            )
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/capabilities",
+                headers={"Authorization": "Bearer sk-untrusted"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            trusted = data["trusted_surface"]
+            assert trusted["dark_launch"] is True
+            assert trusted["live_endpoint"] is False
+            assert trusted["ready"] is True
+            assert trusted["separate_credential_required"] is True
+            assert trusted["separate_from_api_server_key"] is True
+            assert trusted["session_model"]["server_authoritative"] is True
+            assert trusted["session_model"]["separate_session_boundary"] is True
+            assert trusted["session_model"]["identity_dimensions"] == [
+                "principal_id",
+                "role",
+                "workspace_id",
+                "tenant_id",
+                "user_id",
+                "owner_id",
+                "device_id",
+                "session_id",
+                "auth_strength",
+                "allowed_toolsets",
+                "allowed_capabilities",
+            ]
+            assert "trusted_surface" not in data["endpoints"]
+
+    def test_shared_api_server_key_cannot_enable_trusted_surface(self):
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "key": "shared-secret",
+                    "trusted_surface": {
+                        "enabled": True,
+                        "credential": "shared-secret",
+                        "principal_id": "principal-owner",
+                        "role": "owner",
+                        "workspace_id": "private",
+                        "tenant_id": "tenant-private",
+                        "user_id": "user-owner",
+                        "owner_id": "owner-root",
+                        "device_id": "device-phone",
+                    },
+                },
+            )
+        )
+        trusted = adapter._trusted_surface_seam.describe_public()
+        assert trusted["ready"] is False
+        assert trusted["config_error"] == "trusted_surface_credential_matches_api_server_key"
+
+    def test_trusted_surface_seam_issues_server_authoritative_identity(self):
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "key": "sk-untrusted",
+                    "trusted_surface": {
+                        "enabled": True,
+                        "credential": "ts-separate",
+                        "principal_id": "principal-owner",
+                        "role": "owner",
+                        "workspace_id": "private",
+                        "tenant_id": "tenant-private",
+                        "user_id": "user-owner",
+                        "owner_id": "owner-root",
+                        "device_id": "device-phone",
+                        "allowed_toolsets": ["terminal", "web"],
+                        "allowed_capabilities": ["memory.read", "skills.read"],
+                    },
+                },
+            )
+        )
+
+        identity = adapter._trusted_surface_seam.authenticate_bearer(
+            "Bearer ts-separate",
+            requested_device_id="device-phone",
+        )
+
+        assert identity.principal_id == "principal-owner"
+        assert identity.role == "owner"
+        assert identity.workspace_id == "private"
+        assert identity.tenant_id == "tenant-private"
+        assert identity.user_id == "user-owner"
+        assert identity.owner_id == "owner-root"
+        assert identity.device_id == "device-phone"
+        assert identity.auth_strength == "trusted_surface"
+        assert identity.allowed_toolsets == ("terminal", "web")
+        assert identity.allowed_capabilities == ("memory.read", "skills.read")
+        assert identity.session_id.startswith("trusted_surface_")
+
+    def test_trusted_surface_seam_rejects_wrong_bearer(self):
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "key": "sk-untrusted",
+                    "trusted_surface": {
+                        "enabled": True,
+                        "credential": "ts-separate",
+                        "principal_id": "principal-owner",
+                        "role": "owner",
+                        "workspace_id": "private",
+                        "tenant_id": "tenant-private",
+                        "user_id": "user-owner",
+                        "owner_id": "owner-root",
+                        "device_id": "device-phone",
+                    },
+                },
+            )
+        )
+
+        with pytest.raises(TrustedSurfaceAuthError) as exc:
+            adapter._trusted_surface_seam.authenticate_bearer("Bearer wrong-token")
+        assert exc.value.code == "invalid_trusted_surface_credential"
+
+    def test_trusted_surface_seam_rejects_wrong_device(self):
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "key": "sk-untrusted",
+                    "trusted_surface": {
+                        "enabled": True,
+                        "credential": "ts-separate",
+                        "principal_id": "principal-owner",
+                        "role": "owner",
+                        "workspace_id": "private",
+                        "tenant_id": "tenant-private",
+                        "user_id": "user-owner",
+                        "owner_id": "owner-root",
+                        "device_id": "device-phone",
+                    },
+                },
+            )
+        )
+
+        with pytest.raises(TrustedSurfaceAuthError) as exc:
+            adapter._trusted_surface_seam.authenticate_bearer(
+                "Bearer ts-separate",
+                requested_device_id="other-device",
+            )
+        assert exc.value.code == "trusted_surface_device_mismatch"
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ from gateway.session import (
     build_session_key,
     canonical_whatsapp_identifier,
 )
+from gateway.trusted_surface import TrustedSurfaceSessionIdentity
 
 # Legacy name preserved for these tests; product renamed the function to
 # canonical_whatsapp_identifier.  Keep the tests referencing the old name
@@ -153,6 +154,64 @@ class TestSessionSourceDescription:
             chat_type="forum", chat_name="Questions",
         )
         assert "Questions" in source.description
+
+
+class TestTrustedSurfaceSessionIdentity:
+    def test_roundtrip_preserves_server_authoritative_scope(self):
+        identity = TrustedSurfaceSessionIdentity(
+            principal_id="principal-owner",
+            role="owner",
+            workspace_id="private",
+            tenant_id="tenant-private",
+            user_id="user-owner",
+            owner_id="owner-root",
+            device_id="device-phone",
+            session_id="trusted_surface_1234",
+            auth_strength="trusted_surface",
+            allowed_toolsets=("terminal", "web"),
+            allowed_capabilities=("memory.read", "skills.read"),
+        )
+
+        payload = identity.to_dict()
+        restored = TrustedSurfaceSessionIdentity.from_dict(
+            payload,
+            authoritative_auth_strength=identity.auth_strength,
+            authoritative_allowed_toolsets=identity.allowed_toolsets,
+            authoritative_allowed_capabilities=identity.allowed_capabilities,
+            authoritative_surface=identity.surface,
+        )
+
+        assert restored == identity
+        assert payload["surface"] == "trusted_surface"
+        assert payload["allowed_toolsets"] == ["terminal", "web"]
+        assert payload["allowed_capabilities"] == ["memory.read", "skills.read"]
+
+    def test_from_dict_ignores_tampered_authoritative_fields(self):
+        restored = TrustedSurfaceSessionIdentity.from_dict(
+            {
+                "surface": "evil_surface",
+                "principal_id": "principal-owner",
+                "role": "owner",
+                "workspace_id": "private",
+                "tenant_id": "tenant-private",
+                "user_id": "user-owner",
+                "owner_id": "owner-root",
+                "device_id": "device-phone",
+                "session_id": "trusted_surface_1234",
+                "auth_strength": "admin_root",
+                "allowed_toolsets": ["terminal", "secret_dump"],
+                "allowed_capabilities": ["memory.read", "skills.write_everything"],
+            },
+            authoritative_auth_strength="trusted_surface",
+            authoritative_allowed_toolsets=("terminal", "web"),
+            authoritative_allowed_capabilities=("memory.read", "skills.read"),
+            authoritative_surface="trusted_surface",
+        )
+
+        assert restored.surface == "trusted_surface"
+        assert restored.auth_strength == "trusted_surface"
+        assert restored.allowed_toolsets == ("terminal", "web")
+        assert restored.allowed_capabilities == ("memory.read", "skills.read")
 
 
 class TestLocalCliFactory:

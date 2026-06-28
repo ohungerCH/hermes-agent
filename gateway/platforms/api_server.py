@@ -58,6 +58,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from gateway.trusted_surface import TrustedSurfaceAdapterSeam, TrustedSurfaceConfig
 
 logger = logging.getLogger(__name__)
 
@@ -839,6 +840,13 @@ class APIServerAdapter(BasePlatformAdapter):
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
         )
+        self._trusted_surface_seam = TrustedSurfaceAdapterSeam(
+            TrustedSurfaceConfig.from_sources(
+                extra.get("trusted_surface"),
+                env=os.environ,
+                api_server_key=self._api_key,
+            )
+        )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -1227,6 +1235,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "type": "bearer",
                 "required": bool(self._api_key),
             },
+            "trusted_surface": self._trusted_surface_seam.describe_public(),
             "runtime": {
                 "mode": "server_agent",
                 "tool_execution": "server",
