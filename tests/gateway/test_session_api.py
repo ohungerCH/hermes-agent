@@ -239,7 +239,57 @@ async def test_trusted_surface_chat_loads_history_and_uses_server_session_key(
     assert "trusted surface live-slice contract" in prompt.lower()
     assert "persistent memory writes" in prompt.lower()
     assert "must never claim" in prompt.lower()
-    assert "scratchpad/docs writes" in prompt.lower()
+    assert "scratchpad/docs note writes may be prepared here" in prompt.lower()
+    assert "explicit confirmation flow" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_trusted_surface_chat_returns_additive_action_intent_without_marker_text(
+    trusted_surface_adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "trusted-action-intent-session",
+        "trusted_surface",
+        user_id="user:owner1",
+        model="test-model",
+    )
+    mock_run = AsyncMock(
+        return_value=(
+            {
+                "final_response": (
+                    "Ich bereite die Notiz vor.\n"
+                    "<<<JARVIS_ACTION_INTENT>>>"
+                    '{"intent_id":"docs-write-1","action":"docs.write","params":{"title":"Martin","content":"Martin will am Donnerstag telefonieren."}}'
+                    "<<<END_JARVIS_ACTION_INTENT>>>"
+                ),
+                "session_id": session_id,
+            },
+            {"total_tokens": 11},
+        )
+    )
+    app = _create_session_app(trusted_surface_adapter)
+    with patch.object(trusted_surface_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/trusted-surface/sessions/{session_id}/chat",
+                json={"message": "Leg eine Notiz an."},
+                headers={"Authorization": f"Bearer {_trusted_surface_token()}"},
+            )
+            assert resp.status == 200
+            payload = await resp.json()
+
+    assert payload["message"]["content"] == "Ich bereite die Notiz vor."
+    assert payload["action_intent"] == [
+        {
+            "intent_id": "docs-write-1",
+            "action": "docs.write",
+            "params": {
+                "title": "Martin",
+                "content": "Martin will am Donnerstag telefonieren.",
+            },
+        }
+    ]
 
 
 @pytest.mark.asyncio
