@@ -281,6 +281,52 @@ async def test_trusted_surface_chat_rejects_foreign_session_and_client_session_k
 
 
 @pytest.mark.asyncio
+async def test_trusted_surface_memory_request_is_answered_honestly_without_model_run(
+    trusted_surface_adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "trusted-memory-session",
+        "trusted_surface",
+        user_id="user:owner1",
+        model="test-model",
+    )
+    mock_run = AsyncMock(
+        return_value=(
+            {"final_response": "should not run", "session_id": session_id},
+            {"total_tokens": 9},
+        )
+    )
+    app = _create_session_app(trusted_surface_adapter)
+    with patch.object(trusted_surface_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/trusted-surface/sessions/{session_id}/chat",
+                json={"message": "Merke dir dauerhaft: Martin will am Donnerstag telefonieren."},
+                headers={"Authorization": f"Bearer {_trusted_surface_token()}"},
+            )
+            assert resp.status == 200
+            payload = await resp.json()
+
+    mock_run.assert_not_awaited()
+    assert payload["message"]["content"] == (
+        "Ich behalte das für diesen Gesprächsverlauf im Kontext. "
+        "Dauerhaft gespeichert ist es hier im Owner-Modus noch nicht."
+    )
+    assert payload["usage"] == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    messages = session_db.get_messages(session_id)
+    assert [m["role"] for m in messages[-2:]] == ["user", "assistant"]
+    assert messages[-1]["content"] == (
+        "Ich behalte das für diesen Gesprächsverlauf im Kontext. "
+        "Dauerhaft gespeichert ist es hier im Owner-Modus noch nicht."
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeypatch):
     """API-server request sessions should reach tools and terminal subprocess env."""
     monkeypatch.setenv("HERMES_SESSION_ID", "stale-session")

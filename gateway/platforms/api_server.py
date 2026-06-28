@@ -110,6 +110,21 @@ def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
 
 _TRUE_REQUEST_BOOL_STRINGS = frozenset({"1", "true", "yes", "on"})
 _FALSE_REQUEST_BOOL_STRINGS = frozenset({"0", "false", "no", "off"})
+_TRUSTED_SURFACE_GERMAN_MEMORY_REQUEST_MARKERS = (
+    "merk dir",
+    "merke dir",
+    "kannst du dir merken",
+    "speichere",
+    "speicher das",
+    "erinnerung",
+)
+_TRUSTED_SURFACE_ENGLISH_MEMORY_REQUEST_MARKERS = (
+    "remember this",
+    "remember that",
+    "save this",
+    "store this",
+    "memorize this",
+)
 
 
 def _coerce_request_bool(value: Any, default: bool = False) -> bool:
@@ -135,6 +150,24 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return default
+
+
+def _trusted_surface_live_slice_memory_reply(user_message: Any) -> Optional[str]:
+    text = _normalize_chat_content(user_message).strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if any(marker in lowered for marker in _TRUSTED_SURFACE_GERMAN_MEMORY_REQUEST_MARKERS):
+        return (
+            "Ich behalte das für diesen Gesprächsverlauf im Kontext. "
+            "Dauerhaft gespeichert ist es hier im Owner-Modus noch nicht."
+        )
+    if any(marker in lowered for marker in _TRUSTED_SURFACE_ENGLISH_MEMORY_REQUEST_MARKERS):
+        return (
+            "I can keep that in this conversation context, "
+            "but it is not durably stored on this trusted-surface path yet."
+        )
+    return None
 
 
 def _normalize_chat_content(
@@ -1564,6 +1597,27 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key = self._trusted_surface_gateway_session_key(
             identity, session_id
         )
+        deterministic_reply = _trusted_surface_live_slice_memory_reply(user_message)
+        if deterministic_reply is not None:
+            db = self._ensure_session_db()
+            if db is not None:
+                db.append_message(session_id, "user", user_message)
+                db.append_message(session_id, "assistant", deterministic_reply)
+            headers = {"X-Hermes-Session-Id": session_id}
+            return web.json_response(
+                {
+                    "object": "hermes.trusted_surface.chat.completion",
+                    "surface": "trusted_surface",
+                    "session_id": session_id,
+                    "message": {"role": "assistant", "content": deterministic_reply},
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                },
+                headers=headers,
+            )
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
