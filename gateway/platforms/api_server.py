@@ -1405,6 +1405,25 @@ class APIServerAdapter(BasePlatformAdapter):
             f"{identity.tenant_id}:{identity.workspace_id}:{identity.user_id}:{session_id}"
         )[: APIServerAdapter._MAX_SESSION_HEADER_LEN]
 
+    @staticmethod
+    def _trusted_surface_live_slice_system_prompt() -> str:
+        return (
+            "Trusted surface live-slice contract:\n"
+            "- This path currently has text chat sessions only.\n"
+            "- Persistent memory writes, scratchpad/docs writes, kanban mutations, "
+            "skill creation or edits, reminders, and other durable side effects are "
+            "not live on this path yet.\n"
+            "- You may use the current chat transcript as short-term context only.\n"
+            "- You must never claim that something was permanently stored, remembered, "
+            "written, queued, scheduled, created, or changed unless that action actually "
+            "executed and you have an explicit server-side result or receipt in this turn.\n"
+            "- If the user asks for durable storage or a lasting memory, answer honestly "
+            "that this trusted-surface path cannot persist it yet. You may say you can "
+            "keep it in the current conversation only.\n"
+            "- Do not invent confirmations, receipts, cards, notes, kanban entries, "
+            "skills, reminders, or background jobs."
+        )
+
     def _get_trusted_surface_session_or_404(
         self,
         session_id: str,
@@ -1544,6 +1563,7 @@ class APIServerAdapter(BasePlatformAdapter):
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
+            ephemeral_system_prompt=self._trusted_surface_live_slice_system_prompt(),
             session_id=session_id,
             gateway_session_key=gateway_session_key,
         )

@@ -234,6 +234,12 @@ async def test_trusted_surface_chat_loads_history_and_uses_server_session_key(
     assert history[0]["content"] == "trusted earlier"
     assert history[1]["role"] == "assistant"
     assert history[1]["content"] == "trusted prior answer"
+    prompt = kwargs["ephemeral_system_prompt"]
+    assert isinstance(prompt, str)
+    assert "trusted surface live-slice contract" in prompt.lower()
+    assert "persistent memory writes" in prompt.lower()
+    assert "must never claim" in prompt.lower()
+    assert "scratchpad/docs writes" in prompt.lower()
 
 
 @pytest.mark.asyncio
