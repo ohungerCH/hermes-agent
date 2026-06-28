@@ -1420,6 +1420,10 @@ class APIServerAdapter(BasePlatformAdapter):
             "- If the user asks for durable storage or a lasting memory, answer honestly "
             "that this trusted-surface path cannot persist it yet. You may say you can "
             "keep it in the current conversation only.\n"
+            "- Do not say that you noted, wrote down, filed, saved, added, or stored "
+            "anything unless it actually happened. Prefer concise phrasing such as: "
+            "\"I can keep that in the current conversation, but it is not durably "
+            "stored here yet.\"\n"
             "- Do not invent confirmations, receipts, cards, notes, kanban entries, "
             "skills, reminders, or background jobs."
         )
