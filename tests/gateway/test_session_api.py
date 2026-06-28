@@ -3,6 +3,7 @@
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import jwt
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -48,6 +49,11 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
+    app.router.add_post("/api/trusted-surface/sessions", adapter._handle_trusted_surface_create_session)
+    app.router.add_post(
+        "/api/trusted-surface/sessions/{session_id}/chat",
+        adapter._handle_trusted_surface_session_chat,
+    )
     return app
 
 
@@ -73,6 +79,199 @@ async def test_capabilities_advertises_session_control_surface(adapter):
         "method": "POST",
         "path": "/api/sessions/{session_id}/chat/stream",
     }
+
+
+@pytest.fixture
+def trusted_surface_adapter(session_db):
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "key": "sk-untrusted",
+                "trusted_surface": {
+                    "enabled": True,
+                    "signing_key": "trusted-signing-key",
+                },
+            },
+        )
+    )
+    adapter._session_db = session_db
+    return adapter
+
+
+def _trusted_surface_token(
+    *,
+    allowed_capabilities=None,
+    device_id: str = "devA",
+    principal_id: str = "owner:owner1",
+    workspace_id: str = "private",
+    tenant_id: str = "1a7530bd-3ae8-46b4-96a6-86a510debdab",
+    user_id: str = "user:owner1",
+    owner_id: str = "owner1",
+    role: str = "owner",
+    auth_strength: str = "biometric_step_up",
+) -> str:
+    return jwt.encode(
+        {
+            "surface": "trusted_surface",
+            "principal_id": principal_id,
+            "role": role,
+            "workspace_id": workspace_id,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "owner_id": owner_id,
+            "device_id": device_id,
+            "auth_strength": auth_strength,
+            "allowed_toolsets": [],
+            "allowed_capabilities": list(
+                allowed_capabilities
+                or ["session.describe", "session.open", "session.chat"]
+            ),
+        },
+        "trusted-signing-key",
+        algorithm="HS256",
+    )
+
+
+@pytest.mark.asyncio
+async def test_capabilities_advertise_trusted_surface_session_routes_when_live(
+    trusted_surface_adapter,
+):
+    app = _create_session_app(trusted_surface_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/v1/capabilities", headers={"Authorization": "Bearer sk-untrusted"})
+        assert resp.status == 200
+        data = await resp.json()
+
+    assert data["endpoints"]["trusted_surface_session_describe"] == {
+        "method": "GET",
+        "path": "/api/trusted-surface/session/describe",
+    }
+    assert data["endpoints"]["trusted_surface_sessions"] == {
+        "method": "POST",
+        "path": "/api/trusted-surface/sessions",
+    }
+    assert data["endpoints"]["trusted_surface_session_chat"] == {
+        "method": "POST",
+        "path": "/api/trusted-surface/sessions/{session_id}/chat",
+    }
+
+
+@pytest.mark.asyncio
+async def test_trusted_surface_create_session_requires_trusted_surface_bearer(
+    trusted_surface_adapter,
+):
+    app = _create_session_app(trusted_surface_adapter)
+    trusted_token = _trusted_surface_token()
+    async with TestClient(TestServer(app)) as cli:
+        rejected = await cli.post(
+            "/api/trusted-surface/sessions",
+            headers={"Authorization": "Bearer sk-untrusted"},
+            json={},
+        )
+        assert rejected.status == 401
+
+        ok = await cli.post(
+            "/api/trusted-surface/sessions",
+            headers={"Authorization": f"Bearer {trusted_token}"},
+            json={},
+        )
+        assert ok.status == 201
+        payload = await ok.json()
+
+    assert payload["object"] == "hermes.trusted_surface.session"
+    assert payload["surface"] == "trusted_surface"
+    assert payload["identity"]["user_id"] == "user:owner1"
+    assert payload["session"]["source"] == "trusted_surface"
+    assert payload["session"]["user_id"] == "user:owner1"
+
+
+@pytest.mark.asyncio
+async def test_trusted_surface_chat_loads_history_and_uses_server_session_key(
+    trusted_surface_adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "trusted-chat-session",
+        "trusted_surface",
+        user_id="user:owner1",
+        model="test-model",
+    )
+    session_db.append_message(session_id, "user", "trusted earlier")
+    session_db.append_message(session_id, "assistant", "trusted prior answer")
+
+    mock_run = AsyncMock(
+        return_value=(
+            {"final_response": "trusted fresh answer", "session_id": session_id},
+            {"total_tokens": 7},
+        )
+    )
+    app = _create_session_app(trusted_surface_adapter)
+    with patch.object(trusted_surface_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/trusted-surface/sessions/{session_id}/chat",
+                json={"message": "next trusted turn"},
+                headers={
+                    "Authorization": f"Bearer {_trusted_surface_token()}",
+                },
+            )
+            assert resp.status == 200
+            payload = await resp.json()
+
+    assert resp.headers["X-Hermes-Session-Id"] == session_id
+    assert payload["object"] == "hermes.trusted_surface.chat.completion"
+    assert payload["surface"] == "trusted_surface"
+    assert payload["session_id"] == session_id
+    assert payload["message"]["content"] == "trusted fresh answer"
+    mock_run.assert_awaited_once()
+    _, kwargs = mock_run.call_args
+    assert kwargs["session_id"] == session_id
+    assert kwargs["gateway_session_key"].startswith("trusted_surface:")
+    history = kwargs["conversation_history"]
+    assert len(history) == 2
+    assert history[0]["role"] == "user"
+    assert history[0]["content"] == "trusted earlier"
+    assert history[1]["role"] == "assistant"
+    assert history[1]["content"] == "trusted prior answer"
+
+
+@pytest.mark.asyncio
+async def test_trusted_surface_chat_rejects_foreign_session_and_client_session_key(
+    trusted_surface_adapter,
+    session_db,
+):
+    api_server_session = session_db.create_session(
+        "plain-api-session",
+        "api_server",
+        user_id="user:owner1",
+    )
+    trusted_session = session_db.create_session(
+        "trusted-owned-session",
+        "trusted_surface",
+        user_id="user:owner1",
+    )
+    app = _create_session_app(trusted_surface_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        wrong_source = await cli.post(
+            f"/api/trusted-surface/sessions/{api_server_session}/chat",
+            json={"message": "should fail"},
+            headers={"Authorization": f"Bearer {_trusted_surface_token()}"},
+        )
+        assert wrong_source.status == 404
+
+        injected_key = await cli.post(
+            f"/api/trusted-surface/sessions/{trusted_session}/chat",
+            json={"message": "should also fail"},
+            headers={
+                "Authorization": f"Bearer {_trusted_surface_token()}",
+                "X-Hermes-Session-Key": "client-controlled-scope",
+            },
+        )
+        assert injected_key.status == 400
+        payload = await injected_key.json()
+
+    assert payload["error"]["code"] == "trusted_surface_session_key_not_allowed"
 
 
 @pytest.mark.asyncio

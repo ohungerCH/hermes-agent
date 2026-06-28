@@ -412,6 +412,45 @@ class TestAuth:
         assert result is not None
         assert result.status == 401
 
+    def test_signed_trusted_surface_jwt_does_not_satisfy_api_server_auth(self):
+        token = jwt.encode(
+            {
+                "surface": "trusted_surface",
+                "principal_id": "owner:owner1",
+                "role": "owner",
+                "workspace_id": "private",
+                "tenant_id": "1a7530bd-3ae8-46b4-96a6-86a510debdab",
+                "user_id": "user:owner1",
+                "owner_id": "owner1",
+                "device_id": "devA",
+                "auth_strength": "biometric_step_up",
+                "allowed_toolsets": [],
+                "allowed_capabilities": [
+                    "session.describe",
+                    "session.open",
+                    "session.chat",
+                ],
+            },
+            "trusted-signing-key",
+            algorithm="HS256",
+        )
+        config = PlatformConfig(
+            enabled=True,
+            extra={
+                "key": "sk-untrusted",
+                "trusted_surface": {
+                    "enabled": True,
+                    "signing_key": "trusted-signing-key",
+                },
+            },
+        )
+        adapter = APIServerAdapter(config)
+        mock_request = MagicMock()
+        mock_request.headers = {"Authorization": f"Bearer {token}"}
+        result = adapter._check_auth(mock_request)
+        assert result is not None
+        assert result.status == 401
+
 
 # ---------------------------------------------------------------------------
 # Helpers for HTTP tests

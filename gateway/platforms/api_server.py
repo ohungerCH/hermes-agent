@@ -62,6 +62,7 @@ from gateway.trusted_surface import (
     TrustedSurfaceAdapterSeam,
     TrustedSurfaceAuthError,
     TrustedSurfaceConfig,
+    TrustedSurfaceSessionIdentity,
 )
 
 logger = logging.getLogger(__name__)
@@ -1260,6 +1261,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "method": "GET",
                 "path": "/api/trusted-surface/session/describe",
             }
+            endpoints["trusted_surface_sessions"] = {
+                "method": "POST",
+                "path": "/api/trusted-surface/sessions",
+            }
+            endpoints["trusted_surface_session_chat"] = {
+                "method": "POST",
+                "path": "/api/trusted-surface/sessions/{session_id}/chat",
+            }
 
         return web.json_response({
             "object": "hermes.api_server.capabilities",
@@ -1340,6 +1349,222 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         return web.json_response(identity.to_dict())
+
+    def _authenticate_trusted_surface_request(
+        self,
+        request: "web.Request",
+        *,
+        required_capability: Optional[str] = None,
+    ) -> tuple[Optional[TrustedSurfaceSessionIdentity], Optional["web.Response"]]:
+        trusted_surface = self._trusted_surface_seam.describe_public()
+        if not trusted_surface.get("live_endpoint"):
+            return None, web.json_response(
+                _openai_error(
+                    "Trusted surface is not enabled.",
+                    code="trusted_surface_unavailable",
+                ),
+                status=404,
+            )
+
+        authorization = request.headers.get("Authorization", "")
+        requested_device_id = request.headers.get("X-Jarvis-Device-Id")
+        try:
+            identity = self._trusted_surface_seam.authenticate_bearer(
+                authorization,
+                requested_device_id=requested_device_id,
+            )
+        except TrustedSurfaceAuthError as exc:
+            return None, web.json_response(
+                _openai_error(
+                    "Trusted surface authentication failed.",
+                    code=exc.code,
+                ),
+                status=401,
+            )
+
+        if required_capability:
+            allowed = set(identity.allowed_capabilities or ())
+            if required_capability not in allowed:
+                return None, web.json_response(
+                    _openai_error(
+                        f"Trusted surface capability not granted: {required_capability}",
+                        code="trusted_surface_capability_denied",
+                    ),
+                    status=403,
+                )
+
+        return identity, None
+
+    @staticmethod
+    def _trusted_surface_gateway_session_key(
+        identity: TrustedSurfaceSessionIdentity,
+        session_id: str,
+    ) -> str:
+        return (
+            "trusted_surface:"
+            f"{identity.tenant_id}:{identity.workspace_id}:{identity.user_id}:{session_id}"
+        )[: APIServerAdapter._MAX_SESSION_HEADER_LEN]
+
+    def _get_trusted_surface_session_or_404(
+        self,
+        session_id: str,
+        identity: TrustedSurfaceSessionIdentity,
+    ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        session, err = self._get_existing_session_or_404(session_id)
+        if err:
+            return None, err
+        if (session.get("source") or "") != "trusted_surface":
+            return None, web.json_response(
+                _openai_error(
+                    f"Session not found: {session_id}",
+                    code="session_not_found",
+                ),
+                status=404,
+            )
+        if (session.get("user_id") or "") != identity.user_id:
+            return None, web.json_response(
+                _openai_error(
+                    f"Session not found: {session_id}",
+                    code="session_not_found",
+                ),
+                status=404,
+            )
+        return session, None
+
+    async def _handle_trusted_surface_create_session(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        identity, err = self._authenticate_trusted_surface_request(
+            request,
+            required_capability="session.open",
+        )
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        allowed = {"title"}
+        unknown = sorted(set(body) - allowed)
+        if unknown:
+            return web.json_response(
+                _openai_error(
+                    f"Unsupported trusted surface session fields: {', '.join(unknown)}",
+                    code="unsupported_session_field",
+                ),
+                status=400,
+            )
+
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable",
+                    code="session_db_unavailable",
+                ),
+                status=503,
+            )
+
+        session_id = f"trusted_surface_{uuid.uuid4().hex[:24]}"
+        db.create_session(
+            session_id,
+            "trusted_surface",
+            model=self._model_name,
+            user_id=identity.user_id,
+        )
+        title = body.get("title")
+        if title is not None:
+            try:
+                db.set_session_title(session_id, str(title))
+            except ValueError as exc:
+                db.delete_session(session_id)
+                return web.json_response(
+                    _openai_error(str(exc), code="invalid_title"),
+                    status=400,
+                )
+
+        session = db.get_session(session_id) or {
+            "id": session_id,
+            "source": "trusted_surface",
+            "user_id": identity.user_id,
+            "model": self._model_name,
+        }
+        return web.json_response(
+            {
+                "object": "hermes.trusted_surface.session",
+                "surface": "trusted_surface",
+                "identity": identity.to_dict(),
+                "session": self._session_response(session),
+            },
+            status=201,
+        )
+
+    async def _handle_trusted_surface_session_chat(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        identity, err = self._authenticate_trusted_surface_request(
+            request,
+            required_capability="session.chat",
+        )
+        if err:
+            return err
+        if request.headers.get("X-Hermes-Session-Key", "").strip():
+            return web.json_response(
+                _openai_error(
+                    "Trusted surface does not accept client-supplied session keys.",
+                    code="trusted_surface_session_key_not_allowed",
+                ),
+                status=400,
+            )
+
+        session_id = request.match_info["session_id"]
+        _, err = self._get_trusted_surface_session_or_404(session_id, identity)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        if body.get("system_message") is not None or body.get("instructions") is not None:
+            return web.json_response(
+                _openai_error(
+                    "Trusted surface system prompt override is not supported.",
+                    code="trusted_surface_system_message_not_allowed",
+                ),
+                status=400,
+            )
+        user_message, err = _session_chat_user_message(body)
+        if err is not None:
+            return err
+
+        history = self._conversation_history_for_session(session_id)
+        gateway_session_key = self._trusted_surface_gateway_session_key(
+            identity, session_id
+        )
+        result, usage = await self._run_agent(
+            user_message=user_message,
+            conversation_history=history,
+            session_id=session_id,
+            gateway_session_key=gateway_session_key,
+        )
+        effective_session_id = (
+            result.get("session_id") if isinstance(result, dict) else session_id
+        )
+        final_response = (
+            result.get("final_response", "") if isinstance(result, dict) else ""
+        )
+        tts_text, action_intent = extract_action_intent(final_response)
+        headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
+        response_body: Dict[str, Any] = {
+            "object": "hermes.trusted_surface.chat.completion",
+            "surface": "trusted_surface",
+            "session_id": effective_session_id or session_id,
+            "message": {"role": "assistant", "content": tts_text},
+            "usage": usage,
+        }
+        if action_intent is not None:
+            response_body["action_intent"] = action_intent
+        return web.json_response(response_body, headers=headers)
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -4326,6 +4551,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._app.router.add_get(
                     "/api/trusted-surface/session/describe",
                     self._handle_trusted_surface_session_describe,
+                )
+                self._app.router.add_post(
+                    "/api/trusted-surface/sessions",
+                    self._handle_trusted_surface_create_session,
+                )
+                self._app.router.add_post(
+                    "/api/trusted-surface/sessions/{session_id}/chat",
+                    self._handle_trusted_surface_session_chat,
                 )
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
