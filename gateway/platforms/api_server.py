@@ -58,7 +58,11 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
-from gateway.trusted_surface import TrustedSurfaceAdapterSeam, TrustedSurfaceConfig
+from gateway.trusted_surface import (
+    TrustedSurfaceAdapterSeam,
+    TrustedSurfaceAuthError,
+    TrustedSurfaceConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1227,6 +1231,36 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        trusted_surface = self._trusted_surface_seam.describe_public()
+        endpoints = {
+            "health": {"method": "GET", "path": "/health"},
+            "health_detailed": {"method": "GET", "path": "/health/detailed"},
+            "models": {"method": "GET", "path": "/v1/models"},
+            "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
+            "responses": {"method": "POST", "path": "/v1/responses"},
+            "runs": {"method": "POST", "path": "/v1/runs"},
+            "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
+            "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
+            "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
+            "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+            "skills": {"method": "GET", "path": "/v1/skills"},
+            "toolsets": {"method": "GET", "path": "/v1/toolsets"},
+            "sessions": {"method": "GET", "path": "/api/sessions"},
+            "session_create": {"method": "POST", "path": "/api/sessions"},
+            "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
+            "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
+            "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
+            "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
+            "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
+            "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
+            "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+        }
+        if trusted_surface.get("live_endpoint"):
+            endpoints["trusted_surface_session_describe"] = {
+                "method": "GET",
+                "path": "/api/trusted-surface/session/describe",
+            }
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -1235,7 +1269,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "type": "bearer",
                 "required": bool(self._api_key),
             },
-            "trusted_surface": self._trusted_surface_seam.describe_public(),
+            "trusted_surface": trusted_surface,
             "runtime": {
                 "mode": "server_agent",
                 "tool_execution": "server",
@@ -1272,30 +1306,40 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
             },
-            "endpoints": {
-                "health": {"method": "GET", "path": "/health"},
-                "health_detailed": {"method": "GET", "path": "/health/detailed"},
-                "models": {"method": "GET", "path": "/v1/models"},
-                "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
-                "responses": {"method": "POST", "path": "/v1/responses"},
-                "runs": {"method": "POST", "path": "/v1/runs"},
-                "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
-                "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
-                "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
-                "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
-                "skills": {"method": "GET", "path": "/v1/skills"},
-                "toolsets": {"method": "GET", "path": "/v1/toolsets"},
-                "sessions": {"method": "GET", "path": "/api/sessions"},
-                "session_create": {"method": "POST", "path": "/api/sessions"},
-                "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
-                "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
-                "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
-                "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
-                "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
-                "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
-                "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
-            },
+            "endpoints": endpoints,
         })
+
+    async def _handle_trusted_surface_session_describe(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        trusted_surface = self._trusted_surface_seam.describe_public()
+        if not trusted_surface.get("live_endpoint"):
+            return web.json_response(
+                _openai_error(
+                    "Trusted surface session describe is not enabled.",
+                    code="trusted_surface_unavailable",
+                ),
+                status=404,
+            )
+
+        authorization = request.headers.get("Authorization", "")
+        requested_device_id = request.headers.get("X-Jarvis-Device-Id")
+        try:
+            identity = self._trusted_surface_seam.authenticate_bearer(
+                authorization,
+                requested_device_id=requested_device_id,
+            )
+        except TrustedSurfaceAuthError as exc:
+            return web.json_response(
+                _openai_error(
+                    "Trusted surface authentication failed.",
+                    code=exc.code,
+                ),
+                status=401,
+            )
+
+        return web.json_response(identity.to_dict())
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -4278,6 +4322,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
+            if self._trusted_surface_seam.describe_public().get("live_endpoint"):
+                self._app.router.add_get(
+                    "/api/trusted-surface/session/describe",
+                    self._handle_trusted_surface_session_describe,
+                )
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)

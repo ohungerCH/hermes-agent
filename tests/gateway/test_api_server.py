@@ -21,6 +21,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import jwt
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -440,6 +441,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    app.router.add_get(
+        "/api/trusted-surface/session/describe",
+        adapter._handle_trusted_surface_session_describe,
+    )
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -887,6 +892,64 @@ class TestCapabilitiesEndpoint:
                 requested_device_id="other-device",
             )
         assert exc.value.code == "trusted_surface_device_mismatch"
+
+    @pytest.mark.asyncio
+    async def test_trusted_surface_session_describe_requires_separate_signed_jwt(self):
+        token = jwt.encode(
+            {
+                "surface": "trusted_surface",
+                "principal_id": "owner:owner1",
+                "role": "owner",
+                "workspace_id": "private",
+                "tenant_id": "tenant-001",
+                "user_id": "user:owner1",
+                "owner_id": "owner1",
+                "device_id": "devA",
+                "auth_strength": "biometric_step_up",
+                "allowed_toolsets": [],
+                "allowed_capabilities": ["session.describe"],
+            },
+            "trusted-signing-key",
+            algorithm="HS256",
+        )
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "key": "sk-untrusted",
+                    "trusted_surface": {
+                        "enabled": True,
+                        "signing_key": "trusted-signing-key",
+                    },
+                },
+            )
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            ok = await cli.get(
+                "/api/trusted-surface/session/describe",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert ok.status == 200
+            data = await ok.json()
+            assert data["surface"] == "trusted_surface"
+            assert data["principal_id"] == "owner:owner1"
+            assert data["role"] == "owner"
+            assert data["workspace_id"] == "private"
+            assert data["tenant_id"] == "tenant-001"
+            assert data["user_id"] == "user:owner1"
+            assert data["owner_id"] == "owner1"
+            assert data["device_id"] == "devA"
+            assert data["auth_strength"] == "biometric_step_up"
+            assert data["allowed_toolsets"] == []
+            assert data["allowed_capabilities"] == ["session.describe"]
+            assert data["session_id"].startswith("trusted_surface_")
+
+            rejected = await cli.get(
+                "/api/trusted-surface/session/describe",
+                headers={"Authorization": "Bearer sk-untrusted"},
+            )
+            assert rejected.status == 401
 
 
 # ---------------------------------------------------------------------------

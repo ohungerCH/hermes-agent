@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional
 
+import jwt
+
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
@@ -140,6 +142,7 @@ class TrustedSurfaceConfig:
 
     enabled: bool = False
     credential: str = ""
+    signing_key: str = ""
     principal_id: str = ""
     role: str = ""
     workspace_id: str = ""
@@ -169,6 +172,10 @@ class TrustedSurfaceConfig:
         )
         credential = _normalize_text(
             _env_or_mapping(env_map, mapping, "TRUSTED_SURFACE_CREDENTIAL", "credential"),
+            max_len=512,
+        )
+        signing_key = _normalize_text(
+            _env_or_mapping(env_map, mapping, "TRUSTED_SURFACE_SIGNING_KEY", "signing_key"),
             max_len=512,
         )
         principal_id = _normalize_text(
@@ -215,24 +222,29 @@ class TrustedSurfaceConfig:
 
         config_error: Optional[str] = None
         if enabled:
-            required = (
-                credential,
-                principal_id,
-                role,
-                workspace_id,
-                tenant_id,
-                user_id,
-                owner_id,
-                device_id,
-            )
-            if not all(required):
-                config_error = "trusted_surface_missing_identity_fields"
-            elif api_server_key and hmac.compare_digest(credential, api_server_key):
-                config_error = "trusted_surface_credential_matches_api_server_key"
+            if signing_key:
+                if api_server_key and hmac.compare_digest(signing_key, api_server_key):
+                    config_error = "trusted_surface_signing_key_matches_api_server_key"
+            else:
+                required = (
+                    credential,
+                    principal_id,
+                    role,
+                    workspace_id,
+                    tenant_id,
+                    user_id,
+                    owner_id,
+                    device_id,
+                )
+                if not all(required):
+                    config_error = "trusted_surface_missing_identity_fields"
+                elif api_server_key and hmac.compare_digest(credential, api_server_key):
+                    config_error = "trusted_surface_credential_matches_api_server_key"
 
         return cls(
             enabled=enabled,
             credential=credential,
+            signing_key=signing_key,
             principal_id=principal_id,
             role=role,
             workspace_id=workspace_id,
@@ -248,7 +260,13 @@ class TrustedSurfaceConfig:
 
     @property
     def ready(self) -> bool:
-        return self.enabled and not self.config_error
+        if not self.enabled or self.config_error:
+            return False
+        return bool(self.signing_key or self.credential)
+
+    @property
+    def live_endpoint(self) -> bool:
+        return self.ready and bool(self.signing_key)
 
 
 class TrustedSurfaceAuthError(Exception):
@@ -285,14 +303,18 @@ class TrustedSurfaceAdapterSeam:
 
     def describe_public(self) -> Dict[str, Any]:
         return {
-            "dark_launch": True,
-            "live_endpoint": False,
+            "dark_launch": not self._config.live_endpoint,
+            "live_endpoint": self._config.live_endpoint,
             "enabled": self._config.enabled,
             "ready": self._config.ready,
             "config_error": self._config.config_error,
             "separate_credential_required": True,
             "separate_from_api_server_key": True,
-            "reserved_adapter_path": None,
+            "reserved_adapter_path": (
+                "/api/trusted-surface/session/describe"
+                if self._config.live_endpoint
+                else None
+            ),
             "session_model": {
                 "server_authoritative": True,
                 "separate_session_boundary": True,
@@ -314,6 +336,11 @@ class TrustedSurfaceAdapterSeam:
             token = authorization_header[7:].strip()
         if not token:
             raise TrustedSurfaceAuthError("missing_trusted_surface_bearer")
+        if self._config.signing_key:
+            return self._authenticate_signed_claim_token(
+                token,
+                requested_device_id=requested_device_id,
+            )
         if not hmac.compare_digest(token, self._config.credential):
             raise TrustedSurfaceAuthError("invalid_trusted_surface_credential")
 
@@ -334,3 +361,57 @@ class TrustedSurfaceAdapterSeam:
             allowed_toolsets=self._config.allowed_toolsets,
             allowed_capabilities=self._config.allowed_capabilities,
         )
+
+    def _authenticate_signed_claim_token(
+        self,
+        token: str,
+        *,
+        requested_device_id: Optional[str] = None,
+    ) -> TrustedSurfaceSessionIdentity:
+        try:
+            claims = jwt.decode(
+                token,
+                self._config.signing_key,
+                algorithms=["HS256"],
+                options={"verify_aud": False},
+            )
+        except Exception as exc:
+            raise TrustedSurfaceAuthError("invalid_trusted_surface_credential") from exc
+
+        surface = _normalize_text(claims.get("surface"))
+        if surface != "trusted_surface":
+            raise TrustedSurfaceAuthError("invalid_trusted_surface_surface")
+
+        device_id = _normalize_text(claims.get("device_id"))
+        inbound_device_id = _normalize_text(requested_device_id)
+        if not device_id:
+            raise TrustedSurfaceAuthError("trusted_surface_missing_device_id")
+        if inbound_device_id and inbound_device_id != device_id:
+            raise TrustedSurfaceAuthError("trusted_surface_device_mismatch")
+
+        identity = TrustedSurfaceSessionIdentity(
+            principal_id=_normalize_text(claims.get("principal_id"), max_len=256),
+            role=_normalize_text(claims.get("role")),
+            workspace_id=_normalize_text(claims.get("workspace_id")),
+            tenant_id=_normalize_text(claims.get("tenant_id")),
+            user_id=_normalize_text(claims.get("user_id")),
+            owner_id=_normalize_text(claims.get("owner_id")),
+            device_id=device_id,
+            session_id=f"trusted_surface_{uuid.uuid4().hex[:24]}",
+            auth_strength=_normalize_text(claims.get("auth_strength")) or "trusted_surface",
+            allowed_toolsets=_normalize_csv(claims.get("allowed_toolsets")),
+            allowed_capabilities=_normalize_csv(claims.get("allowed_capabilities")),
+            surface="trusted_surface",
+        )
+        required = (
+            identity.principal_id,
+            identity.role,
+            identity.workspace_id,
+            identity.tenant_id,
+            identity.user_id,
+            identity.owner_id,
+            identity.device_id,
+        )
+        if not all(required):
+            raise TrustedSurfaceAuthError("trusted_surface_missing_identity_fields")
+        return identity
