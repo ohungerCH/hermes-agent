@@ -590,6 +590,130 @@ class TestPromptContent:
 
 
 # ---------------------------------------------------------------------------
+# 6b. S3 (research-on-docs): the OPTIONAL doc_ref context.
+#
+# doc_ref is a RELATIVE docs/ selector folded into the prompt as a READ-ONLY
+# background section. The worker re-resolves it (Defense-in-Depth) against ITS
+# OWN read-only docs mount (DOCS_RO_ROOT) and NEVER trusts the file. Any
+# traversal / absolute / out-of-mount / symlink-escape selector -> ignored, NO
+# read, the job runs web-only (fail-soft). The lane pins are UNCHANGED (doc_ref
+# is not a lane field). The doc content / selector are NEVER logged.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def _docs_ro_root(tmp_path, monkeypatch):
+    """A real read-only docs root with one valid file, one file OUTSIDE the root,
+    and a symlink inside the root that escapes outward. DOCS_RO_ROOT is pointed at
+    the docs/ subtree so the worker's _resolve_doc_ref guard runs for real."""
+    root = tmp_path / "docs"
+    (root / "current").mkdir(parents=True)
+    (root / "current" / "20_SECURITY.md").write_text(
+        "# Security\nDIESISTDERDOCKOERPER und Konzept-Inhalt.", encoding="utf-8"
+    )
+    (tmp_path / "OUTSIDE.txt").write_text("GEHEIMAUSSERHALB der Wurzel", encoding="utf-8")
+    try:
+        (root / "escape.md").symlink_to(tmp_path / "OUTSIDE.txt")
+    except (OSError, NotImplementedError):
+        pass  # symlink may be unsupported; the other cases still cover the guard
+    monkeypatch.setenv("DOCS_RO_ROOT", str(root))
+    return root
+
+
+class TestS3DocRef:
+    def test_schema_v3_accepted_and_fires(self, _isolate_home):
+        # S3 contract: the bridge emits research.enqueue.v3 when a validated doc_ref
+        # is present (ADDITIVE — v2 fields + doc_ref sibling). The worker MUST accept
+        # it and fire, NOT quarantine it (regression guard for the schema allowlist).
+        p = _write_enqueue(
+            _isolate_home,
+            _enqueue(schema="research.enqueue.v3", doc_ref="current/20_SECURITY.md"),
+        )
+        with patch.object(rw, "cronjob", return_value=_ok_cron_return("job-v3")) as m:
+            res = process_one(p)
+        assert res == "job-v3"
+        m.assert_called_once()
+        # Lane pins UNCHANGED — doc_ref never widens the bahn.
+        assert m.call_args.kwargs["enabled_toolsets"] == list(_RESEARCH_TOOLSET)
+        assert (p.parent / (p.name + ".processing.done")).exists()
+        assert not (p.parent / (p.name + ".processing.failed")).exists()
+
+    def test_normalise_carries_doc_ref(self):
+        n = _normalise_enqueue(_enqueue(schema="research.enqueue.v3", doc_ref="current/x.md"))
+        assert n["doc_ref"] == "current/x.md"
+        # absent -> empty string (never None / never crashes)
+        assert _normalise_enqueue(_enqueue())["doc_ref"] == ""
+
+    def test_resolve_valid_doc_ref(self, _docs_ro_root):
+        real = rw._resolve_doc_ref("current/20_SECURITY.md")
+        assert real is not None and real.endswith("current/20_SECURITY.md")
+
+    @pytest.mark.parametrize("evil", [
+        "../../etc/passwd",            # parent traversal
+        "/etc/passwd",                 # absolute
+        "current/../../OUTSIDE.txt",   # normalised-out-of-root
+        "escape.md",                   # symlink escape (when supported)
+        "current/nope.md",             # non-existent
+        "bad path with space",         # allowlist (whitespace)
+        "../" * 80 + "etc/passwd",     # deep traversal
+    ])
+    def test_resolve_bad_doc_ref_returns_none(self, _docs_ro_root, evil):
+        assert rw._resolve_doc_ref(evil) is None
+
+    def test_resolve_inert_without_mount(self, monkeypatch):
+        monkeypatch.delenv("DOCS_RO_ROOT", raising=False)
+        assert rw._resolve_doc_ref("current/20_SECURITY.md") is None
+        assert rw._read_doc_ref("current/20_SECURITY.md") == ""
+
+    def test_oversize_selector_rejected(self, _docs_ro_root):
+        assert rw._resolve_doc_ref("a" * 5000) is None
+
+    def test_prompt_embeds_valid_doc_ref_and_guardrail(self, _docs_ro_root):
+        n = _normalise_enqueue(_enqueue(schema="research.enqueue.v3", doc_ref="current/20_SECURITY.md"))
+        prompt = _build_research_prompt(n)
+        assert "## Referenz-Dokument" in prompt
+        assert "DIESISTDERDOCKOERPER" in prompt           # the doc body is folded in
+        # the exfil-mitigation guardrail line is present ONLY when a doc is included
+        assert "KEINE woertlichen" in prompt
+
+    def test_prompt_omits_reference_on_traversal(self, _docs_ro_root):
+        n = _normalise_enqueue(_enqueue(schema="research.enqueue.v3", doc_ref="../../etc/passwd"))
+        prompt = _build_research_prompt(n)
+        assert "## Referenz-Dokument" not in prompt
+        assert "KEINE woertlichen" not in prompt          # guardrail omitted too
+        # the lane-separation HARD RULES are still present (web-only fallback intact)
+        assert "eine Recherche startet niemals eine Recherche" in prompt
+
+    def test_prompt_has_no_reference_when_doc_ref_absent(self):
+        n = _normalise_enqueue(_enqueue())   # no doc_ref
+        prompt = _build_research_prompt(n)
+        assert "## Referenz-Dokument" not in prompt
+        assert "KEINE woertlichen" not in prompt
+
+    def test_outside_root_doc_is_never_read(self, _docs_ro_root):
+        # An out-of-root selector must never read the OUTSIDE file content.
+        n = _normalise_enqueue(_enqueue(schema="research.enqueue.v3", doc_ref="current/../../OUTSIDE.txt"))
+        prompt = _build_research_prompt(n)
+        assert "GEHEIMAUSSERHALB" not in prompt
+
+    def test_doc_content_not_logged(self, _docs_ro_root, caplog):
+        with caplog.at_level(logging.DEBUG):
+            n = _normalise_enqueue(_enqueue(schema="research.enqueue.v3", doc_ref="current/20_SECURITY.md"))
+            _build_research_prompt(n)
+        # the Art.9-latent doc body must never appear in logs (DLP).
+        assert "DIESISTDERDOCKOERPER" not in caplog.text
+
+    def test_read_cap_truncates_large_doc(self, tmp_path, monkeypatch):
+        root = tmp_path / "docs"
+        root.mkdir()
+        big = "X" * (rw._DOC_REF_READ_MAX_BYTES + 5000)
+        (root / "big.md").write_text(big, encoding="utf-8")
+        monkeypatch.setenv("DOCS_RO_ROOT", str(root))
+        text = rw._read_doc_ref("big.md")
+        assert len(text) <= rw._DOC_REF_READ_MAX_BYTES + len("\n…[gekuerzt]")
+        assert text.endswith("[gekuerzt]")
+
+
+# ---------------------------------------------------------------------------
 # 7. Bridge-polled outputs written.
 # ---------------------------------------------------------------------------
 
