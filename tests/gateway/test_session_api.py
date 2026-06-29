@@ -241,6 +241,14 @@ async def test_trusted_surface_chat_loads_history_and_uses_server_session_key(
     assert "must never claim" in prompt.lower()
     assert "scratchpad/docs note writes may be prepared here" in prompt.lower()
     assert "explicit confirmation flow" in prompt.lower()
+    assert "jarvis_action_intent" in prompt.lower()
+    assert "docs.read" in prompt
+    assert "docs.search" in prompt
+    assert "docs.write" in prompt
+    assert "m365.read" in prompt
+    assert "research.request" in prompt
+    assert "sms.send" in prompt
+    assert "media.play" in prompt
 
 
 @pytest.mark.asyncio
