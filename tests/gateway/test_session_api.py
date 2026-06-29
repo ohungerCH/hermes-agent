@@ -620,6 +620,40 @@ async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db)
 
 
 @pytest.mark.asyncio
+async def test_session_chat_accepts_zero_toolset_override_only(
+    auth_adapter, session_db
+):
+    session_id = session_db.create_session("zero-tool-session", "api_server")
+    mock_run = AsyncMock(
+        return_value=(
+            {"final_response": "safe answer", "session_id": session_id},
+            {"total_tokens": 1},
+        )
+    )
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            ok = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "explain this", "enabled_toolsets": []},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert ok.status == 200, await ok.text()
+
+            bad = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "explain this", "enabled_toolsets": ["terminal"]},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert bad.status == 400
+            payload = await bad.json()
+
+    _, kwargs = mock_run.call_args
+    assert kwargs["enabled_toolsets_override"] == []
+    assert payload["error"]["code"] == "enabled_toolsets_not_allowed"
+
+
+@pytest.mark.asyncio
 async def test_session_chat_stream_accepts_multimodal_message(adapter, session_db):
     session_id = session_db.create_session("image-stream-session", "api_server")
     image_payload = [

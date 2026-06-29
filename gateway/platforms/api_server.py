@@ -402,6 +402,45 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
         return None, _multimodal_validation_error(exc, param=param)
 
 
+def _parse_restrictive_toolset_override(
+    body: Dict[str, Any],
+) -> tuple[Optional[List[str]], Optional["web.Response"]]:
+    """Allow only fail-closed per-turn toolset narrowing.
+
+    The session-chat REST surface must not become a generic capability-expansion
+    API. The only supported explicit override today is ``enabled_toolsets: []``,
+    which lets privileged internal callers pin a turn to zero tools.
+    """
+    if "enabled_toolsets" not in body:
+        return None, None
+    value = body.get("enabled_toolsets")
+    if not isinstance(value, list):
+        return None, web.json_response(
+            _openai_error(
+                "enabled_toolsets must be an array",
+                code="invalid_enabled_toolsets",
+            ),
+            status=400,
+        )
+    if any(not isinstance(entry, str) for entry in value):
+        return None, web.json_response(
+            _openai_error(
+                "enabled_toolsets entries must be strings",
+                code="invalid_enabled_toolsets",
+            ),
+            status=400,
+        )
+    if value:
+        return None, web.json_response(
+            _openai_error(
+                "enabled_toolsets override currently only supports []",
+                code="enabled_toolsets_not_allowed",
+            ),
+            status=400,
+        )
+    return [], None
+
+
 # --- Action-Intent-Extraktion (Task #35, sichere Aktuation; no_mcp BEWAHRT) --------
 #
 # Das Brain bleibt tool-los (no_mcp): es hat genau EINEN Ausgabekanal -- Text. Ein
@@ -1142,6 +1181,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        enabled_toolsets_override: Optional[List[str]] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -1172,7 +1212,11 @@ class APIServerAdapter(BasePlatformAdapter):
         model = _resolve_gateway_model()
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets = (
+            sorted(enabled_toolsets_override)
+            if enabled_toolsets_override is not None
+            else sorted(_get_platform_tools(user_config, "api_server"))
+        )
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -2015,6 +2059,11 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
+        enabled_toolsets_override, err = _parse_restrictive_toolset_override(
+            body
+        )
+        if err is not None:
+            return err
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
@@ -2024,6 +2073,7 @@ class APIServerAdapter(BasePlatformAdapter):
             conversation_history=history,
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
+            enabled_toolsets_override=enabled_toolsets_override,
             gateway_session_key=gateway_session_key,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
@@ -2068,6 +2118,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         user_message, err = _session_chat_user_message(body)
+        if err is not None:
+            return err
+        enabled_toolsets_override, err = _parse_restrictive_toolset_override(
+            body
+        )
         if err is not None:
             return err
         system_prompt = body.get("system_message") or body.get("instructions")
@@ -2124,6 +2179,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history=history,
                     ephemeral_system_prompt=system_prompt,
                     session_id=session_id,
+                    enabled_toolsets_override=enabled_toolsets_override,
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
@@ -3962,6 +4018,7 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        enabled_toolsets_override: Optional[List[str]] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -3995,6 +4052,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
+                    enabled_toolsets_override=enabled_toolsets_override,
                     stream_delta_callback=stream_delta_callback,
                     tool_progress_callback=tool_progress_callback,
                     tool_start_callback=tool_start_callback,
