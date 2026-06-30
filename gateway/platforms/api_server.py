@@ -1536,6 +1536,42 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         direct_csv = ", ".join(direct_toolsets)
+        direct_live_lines: List[str] = []
+        if "kanban" in direct_toolsets:
+            direct_live_lines.append(
+                "- For kanban work, use the direct kanban tools instead of faking cards or "
+                "status changes in prose. A task exists only after the tool call succeeds.\n"
+            )
+        if "memory" in direct_toolsets:
+            direct_live_lines.append(
+                "- Durable memory writes are live here via the direct memory tool. Save concise, "
+                "owner-meaningful notes, not raw dumps of foreign content.\n"
+            )
+            direct_live_lines.append(
+                "- When the user wants to remember content that came from mail, SMS, docs, "
+                "diagnostics, timeline, OBD2, or similar foreign sources, take the safe indirect "
+                "path silently: read first, distill the point in your own words, then store only "
+                "the distilled note once the owner's intent is clear.\n"
+            )
+            direct_live_lines.append(
+                "- Do not claim a memory is durably stored unless the direct memory tool actually "
+                "succeeded in this turn.\n"
+            )
+        else:
+            direct_live_lines.append(
+                "- Durable memory writes are not live on this path yet. If the user asks for a "
+                "lasting memory, be honest and keep it only in the current conversation context.\n"
+            )
+        if "skills" in direct_toolsets:
+            direct_live_lines.append(
+                "- Skill creation and edits are live here via the direct skills tools. Use them "
+                "for proven reusable workflows and only claim a skill exists after the tool "
+                "succeeded.\n"
+            )
+        else:
+            direct_live_lines.append(
+                "- Skill creation or edits are not live on this path yet.\n"
+            )
         return (
             "Trusted surface live-slice contract:\n"
             "- This path is a separate owner-authenticated trusted-surface session.\n"
@@ -1551,11 +1587,9 @@ class APIServerAdapter(BasePlatformAdapter):
             "scratchpad note, m365.read for owner calendar/contacts/mail reads, "
             "research.request for a guarded research job, sms.send for a self-only SMS, "
             "and media.play for playback.\n"
-            "- For kanban work, use the direct kanban tools instead of faking cards or status "
-            "changes in prose. A task exists only after the tool call succeeds.\n"
-            "- Persistent memory writes, skill creation or edits, reminders, and other durable "
-            "side effects that are not covered by the live direct toolsets are still not live "
-            "on this path.\n"
+            + "".join(direct_live_lines)
+            + "- Reminders and other durable side effects that are not covered by the live direct "
+            "toolsets above are still not live on this path.\n"
             "- Scratchpad/docs note writes may be prepared here, but they only count as "
             "real after an explicit confirmation flow and an actual server-side result "
             "or receipt in this turn.\n"

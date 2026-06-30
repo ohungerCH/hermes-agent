@@ -294,7 +294,58 @@ async def test_trusted_surface_chat_passes_direct_kanban_toolset_override(
     prompt = kwargs["ephemeral_system_prompt"]
     assert "direct hermes toolsets live today on this path: kanban" in prompt.lower()
     assert "use the direct kanban tools" in prompt.lower()
-    assert "persistent memory writes, skill creation or edits" in prompt.lower()
+    assert "durable memory writes are not live on this path yet" in prompt.lower()
+    assert "skill creation or edits are not live on this path yet" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_trusted_surface_memory_request_reaches_model_when_memory_lane_is_live(
+    trusted_surface_adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "trusted-memory-live-session",
+        "trusted_surface",
+        user_id="user:owner1",
+        model="test-model",
+    )
+    mock_run = AsyncMock(
+        return_value=(
+            {
+                "final_response": "Ich habe mir notiert, dass Martin am Donnerstag telefonieren will.",
+                "session_id": session_id,
+            },
+            {"total_tokens": 8},
+        )
+    )
+    app = _create_session_app(trusted_surface_adapter)
+    with patch.object(trusted_surface_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/trusted-surface/sessions/{session_id}/chat",
+                json={"message": "Merke dir bitte, dass Martin am Donnerstag telefonieren will."},
+                headers={
+                    "Authorization": (
+                        "Bearer "
+                        + _trusted_surface_token(
+                            allowed_toolsets=["kanban", "memory", "skills"]
+                        )
+                    )
+                },
+            )
+            assert resp.status == 200
+            payload = await resp.json()
+
+    mock_run.assert_awaited_once()
+    assert payload["message"]["content"] == (
+        "Ich habe mir notiert, dass Martin am Donnerstag telefonieren will."
+    )
+    _, kwargs = mock_run.call_args
+    assert kwargs["enabled_toolsets_override"] == ["kanban", "memory", "skills"]
+    prompt = kwargs["ephemeral_system_prompt"].lower()
+    assert "durable memory writes are live here via the direct memory tool" in prompt
+    assert "store only the distilled note" in prompt
+    assert "skill creation and edits are live here via the direct skills tools" in prompt
 
 
 @pytest.mark.asyncio
