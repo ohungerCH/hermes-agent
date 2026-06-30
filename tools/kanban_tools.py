@@ -59,6 +59,18 @@ def _profile_has_kanban_toolset() -> bool:
         return False
 
 
+def _trusted_surface_has_kanban_scope() -> bool:
+    """True for the separate trusted-surface api_server session path."""
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        session_key = get_session_env("HERMES_SESSION_KEY", "")
+    except Exception:
+        return False
+    return platform == "api_server" and session_key.startswith("trusted_surface:")
+
+
 def _check_kanban_mode() -> bool:
     """Task-lifecycle tools are available when:
 
@@ -69,9 +81,13 @@ def _check_kanban_mode() -> bool:
     Humans running ``hermes chat`` without the kanban toolset see zero
     kanban tools. Workers spawned by the kanban dispatcher (gateway-
     embedded by default) and orchestrator profiles with the kanban
-    toolset enabled see the Kanban lifecycle tool surface.
+    toolset enabled see the Kanban lifecycle tool surface. The separate
+    trusted-surface api_server path may also expose these tools when its
+    server-issued toolset scope includes ``kanban``.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
+        return True
+    if _trusted_surface_has_kanban_scope():
         return True
     return _profile_has_kanban_toolset()
 
@@ -83,11 +99,19 @@ def _check_kanban_orchestrator_mode() -> bool:
     Dispatcher-spawned workers should close their own task via the
     lifecycle tools (complete/block/heartbeat), not enumerate or unblock
     board state. Profiles that explicitly opt into the kanban toolset
-    and are NOT scoped to a single task are the orchestrator surface.
+    and are NOT scoped to a single task are the orchestrator surface. The
+    separate trusted-surface api_server path counts as an orchestrator
+    surface when it carries the kanban toolset.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
         return False
+    if _trusted_surface_has_kanban_scope():
+        return True
     return _profile_has_kanban_toolset()
+
+
+_check_kanban_mode._session_scoped_check = True
+_check_kanban_orchestrator_mode._session_scoped_check = True
 
 
 # ---------------------------------------------------------------------------

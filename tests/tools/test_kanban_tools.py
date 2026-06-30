@@ -142,6 +142,51 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_trusted_surface_kanban_gate_is_session_scoped_without_ttl_leak(
+    monkeypatch, tmp_path
+):
+    """Trusted-surface visibility must disappear once the session clears."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # ensure registered
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    tokens = set_session_vars(
+        platform="api_server",
+        session_key="trusted_surface:t:private:user:session",
+        session_id="trusted_surface_session_1",
+    )
+    try:
+        invalidate_check_fn_cache()
+        trusted_schema = registry.get_definitions(
+            set(resolve_toolset("kanban")),
+            quiet=True,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    trusted_names = {
+        s["function"].get("name") for s in trusted_schema if "function" in s
+    }
+    assert "kanban_create" in trusted_names
+    assert "kanban_list" in trusted_names
+
+    normal_schema = registry.get_definitions(
+        set(resolve_toolset("kanban")),
+        quiet=True,
+    )
+    normal_names = {
+        s["function"].get("name") for s in normal_schema if "function" in s
+    }
+    assert "kanban_create" not in normal_names
+    assert "kanban_list" not in normal_names
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------

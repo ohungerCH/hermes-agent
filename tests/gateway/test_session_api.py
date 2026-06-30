@@ -102,6 +102,7 @@ def trusted_surface_adapter(session_db):
 def _trusted_surface_token(
     *,
     allowed_capabilities=None,
+    allowed_toolsets=None,
     device_id: str = "devA",
     principal_id: str = "owner:owner1",
     workspace_id: str = "private",
@@ -122,7 +123,7 @@ def _trusted_surface_token(
             "owner_id": owner_id,
             "device_id": device_id,
             "auth_strength": auth_strength,
-            "allowed_toolsets": [],
+            "allowed_toolsets": list(allowed_toolsets or []),
             "allowed_capabilities": list(
                 allowed_capabilities
                 or ["session.describe", "session.open", "session.chat"]
@@ -213,7 +214,7 @@ async def test_trusted_surface_chat_loads_history_and_uses_server_session_key(
                 f"/api/trusted-surface/sessions/{session_id}/chat",
                 json={"message": "next trusted turn"},
                 headers={
-                    "Authorization": f"Bearer {_trusted_surface_token()}",
+                    "Authorization": f"Bearer {_trusted_surface_token(allowed_toolsets=[])}",
                 },
             )
             assert resp.status == 200
@@ -228,6 +229,7 @@ async def test_trusted_surface_chat_loads_history_and_uses_server_session_key(
     _, kwargs = mock_run.call_args
     assert kwargs["session_id"] == session_id
     assert kwargs["gateway_session_key"].startswith("trusted_surface:")
+    assert kwargs["enabled_toolsets_override"] is None
     history = kwargs["conversation_history"]
     assert len(history) == 2
     assert history[0]["role"] == "user"
@@ -249,6 +251,50 @@ async def test_trusted_surface_chat_loads_history_and_uses_server_session_key(
     assert "research.request" in prompt
     assert "sms.send" in prompt
     assert "media.play" in prompt
+
+
+@pytest.mark.asyncio
+async def test_trusted_surface_chat_passes_direct_kanban_toolset_override(
+    trusted_surface_adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "trusted-kanban-session",
+        "trusted_surface",
+        user_id="user:owner1",
+        model="test-model",
+    )
+    mock_run = AsyncMock(
+        return_value=(
+            {
+                "final_response": "Ich habe die Aufgabe im Board angelegt.",
+                "session_id": session_id,
+            },
+            {"total_tokens": 6},
+        )
+    )
+    app = _create_session_app(trusted_surface_adapter)
+    with patch.object(trusted_surface_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/trusted-surface/sessions/{session_id}/chat",
+                json={"message": "Leg eine Kanban-Aufgabe an."},
+                headers={
+                    "Authorization": (
+                        f"Bearer {_trusted_surface_token(allowed_toolsets=['kanban'])}"
+                    )
+                },
+            )
+            assert resp.status == 200
+            payload = await resp.json()
+
+    assert payload["message"]["content"] == "Ich habe die Aufgabe im Board angelegt."
+    _, kwargs = mock_run.call_args
+    assert kwargs["enabled_toolsets_override"] == ["kanban"]
+    prompt = kwargs["ephemeral_system_prompt"]
+    assert "direct hermes toolsets live today on this path: kanban" in prompt.lower()
+    assert "use the direct kanban tools" in prompt.lower()
+    assert "persistent memory writes, skill creation or edits" in prompt.lower()
 
 
 @pytest.mark.asyncio
@@ -361,7 +407,7 @@ async def test_trusted_surface_memory_request_is_answered_honestly_without_model
             resp = await cli.post(
                 f"/api/trusted-surface/sessions/{session_id}/chat",
                 json={"message": "Merke dir dauerhaft: Martin will am Donnerstag telefonieren."},
-                headers={"Authorization": f"Bearer {_trusted_surface_token()}"},
+                headers={"Authorization": f"Bearer {_trusted_surface_token(allowed_toolsets=[])}"},
             )
             assert resp.status == 200
             payload = await resp.json()
@@ -407,7 +453,7 @@ async def test_trusted_surface_memory_meta_question_still_reaches_model(
             resp = await cli.post(
                 f"/api/trusted-surface/sessions/{session_id}/chat",
                 json={"message": "Wie funktioniert deine Erinnerung in diesem Modus?"},
-                headers={"Authorization": f"Bearer {_trusted_surface_token()}"},
+                headers={"Authorization": f"Bearer {_trusted_surface_token(allowed_toolsets=[])}"},
             )
             assert resp.status == 200
             payload = await resp.json()

@@ -125,6 +125,11 @@ _check_fn_cache_lock = threading.Lock()
 
 def _check_fn_cached(fn: Callable) -> bool:
     """Return bool(fn()), TTL-cached across calls. Swallows exceptions as False."""
+    if getattr(fn, "_session_scoped_check", False):
+        try:
+            return bool(fn())
+        except Exception:
+            return False
     now = time.monotonic()
     with _check_fn_cache_lock:
         cached = _check_fn_cache.get(fn)
