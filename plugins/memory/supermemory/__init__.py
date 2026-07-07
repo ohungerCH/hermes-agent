@@ -22,6 +22,45 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+
+# HOOK-ORT / Abfluss-Sperre (ADR-0044 Stufe 3, :243-290). Filter injection
+# content out of the durable egress payload before it reaches the backend. This
+# is a DEFENSE-IN-DEPTH filter on the cloud provider path (the vault's
+# load-bearing gate lives in the VaultStore, INV-3). Both helpers FAIL CLOSED: a
+# broken filter withholds rather than leaking ungated content. Lazy import keeps
+# the plugin loadable even if the sanitizer module is unavailable (then it
+# fails closed to withhold). The flush is a background path -> origin='background';
+# the content is the owner's own conversation (a trusted channel), so
+# from_untrusted_inbound=False (a block message is still dropped regardless).
+
+def _hookort_filter_messages(messages: "list[dict]") -> "list[dict]":
+    """Keep only clean-allow messages for the egress payload; withhold the rest."""
+    try:
+        from tools.write_approval import vault_egress_filter
+        kept, _ = vault_egress_filter(
+            messages or [], origin="background",
+            taint={"from_untrusted_inbound": False})
+        return kept
+    except Exception:
+        logger.error("HOOK-ORT egress filter failed; withholding payload (fail-closed)",
+                     exc_info=True)
+        return []
+
+
+def _hookort_withhold_single(content: str) -> bool:
+    """True if a single add_memory content must be withheld (block/dropped)."""
+    try:
+        from tools.write_approval import vault_egress_filter
+        kept, _ = vault_egress_filter(
+            [{"role": "user", "content": content}], origin="background",
+            taint={"from_untrusted_inbound": False})
+        return not kept
+    except Exception:
+        logger.error("HOOK-ORT add_memory filter failed; withholding (fail-closed)",
+                     exc_info=True)
+        return True
+
+
 _DEFAULT_CONTAINER_TAG = "hermes"
 _DEFAULT_MAX_RECALL_RESULTS = 10
 _DEFAULT_PROFILE_FREQUENCY = 50
@@ -289,6 +328,11 @@ class _SupermemoryClient:
     def add_memory(self, content: str, metadata: Optional[dict] = None, *,
                    entity_context: str = "", container_tag: Optional[str] = None,
                    custom_id: Optional[str] = None) -> dict:
+        # HOOK-ORT: gate the single-item egress. Injection content is withheld
+        # (fail-closed) rather than persisted to the backend.
+        if _hookort_withhold_single(content):
+            logger.warning("HOOK-ORT withheld an add_memory write (gated)")
+            return {"id": "", "gated": True}
         tag = container_tag or self._container_tag
         kwargs: dict[str, Any] = {
             "content": content.strip(),
@@ -365,6 +409,11 @@ class _SupermemoryClient:
         return {"success": True, "message": f'Forgot: "{preview}"', "id": memory_id}
 
     def ingest_conversation(self, session_id: str, messages: list[dict], metadata: dict | None = None) -> None:
+        # HOOK-ORT (ADR-0044:287-289): a block message buffered in _session_turns
+        # must NOT reach the egress payload, even on the crash/atexit flush path.
+        messages = _hookort_filter_messages(messages)
+        if not messages:
+            return  # nothing safe to ingest
         payload: dict = {
             "conversationId": session_id,
             "messages": messages,
@@ -793,6 +842,13 @@ class SupermemoryMemoryProvider(MemoryProvider):
         metadata.pop("source", None)
         try:
             result = self._client.add_memory(content, metadata=metadata, entity_context=self._entity_context, container_tag=tag)
+            if result.get("gated"):
+                # HOOK-ORT withheld this write — NIE-VERLOREN (ADR-0044:228-241):
+                # never drop-and-report-success; surface a visible failure so the
+                # owner can rephrase instead of believing the note was saved.
+                return tool_error(
+                    "Nicht gespeichert: der Inhalt enthält ein Muster, das wie "
+                    "eine eingebettete Anweisung wirkt. Bitte formuliere die Notiz um.")
             preview = content[:80] + ("..." if len(content) > 80 else "")
             resp: dict[str, Any] = {"saved": True, "id": result.get("id", ""), "preview": preview}
             if tag:

@@ -716,3 +716,113 @@ def vault_gate_posture(subsystem: str, *, origin: str, taint: Dict[str, Any],
         return GateDecision(allow=True, taint_marker="retrieval_derived")
     # Unknown origin, clean → fail-closed STAGE for human review.
     return GateDecision(stage=True, message=_vault_stage_message("unbestimmte Herkunft"))
+
+
+# ---------------------------------------------------------------------------
+# Provider-egress filter (Stufe 5 HOOK-ORT / Abfluss-Sperre — ADR-0044 Stufe 3,
+# :243-290)
+# ---------------------------------------------------------------------------
+#
+# A PURE decision/filter over a list of role/content messages headed for a
+# durable memory sink. It scans each memory-role message and returns the gate
+# decisions — it writes NOTHING and sends NOTHING; the CALLER owns the
+# destination. This deliberately keeps the destination out of the primitive so
+# the same code serves two callers without coupling them:
+#   * a provider egress (supermemory today; hindsight / write-through pending the
+#     memory_manager fan-out hook, ADR-0044:261-263) FILTERS what it sends to its
+#     own backend (defense-in-depth: injection content must never reach the
+#     payload, ADR-0044:287-289) — via vault_egress_filter below;
+#   * the future vault provider ROUTES by decision (allow→commit, stage→STAGE,
+#     drop→audit) — via vault_egress_decisions directly.
+# NB: this is an egress FILTER, not the vault's load-bearing gate; that lives in
+# the VaultStore (INV-3, Stufe-5 Phase 2). No embedding happens here (atexit /
+# crash-flush stay safe — the ADR forbids embedding at teardown).
+
+# Roles that are structurally NEVER user memory — system prompts, tool results,
+# reasoning — pass through unscanned (never vectorised, ADR-0042:45). EVERY other
+# role (user/assistant, alternate vocab like human/ai/model/bot, AND unknown
+# roles) is treated as memory content and SCANNED — fail-safe, so an unknown role
+# can never dodge the scan (a future write-through caller may forward alt vocab).
+_NON_MEMORY_ROLES = ("system", "tool", "reasoning", "developer", "function")
+
+
+class EgressDecision:
+    """One message's egress verdict. ``decision`` is the GateDecision; ``index``
+    is the position in the input list (order preserved)."""
+
+    __slots__ = ("index", "role", "content", "decision")
+
+    def __init__(self, index: int, role: str, content: Any, decision: GateDecision):
+        self.index = index
+        self.role = role
+        self.content = content
+        self.decision = decision
+
+
+def _msg_role(m: Any) -> str:
+    return (m.get("role") or "").strip().lower() if isinstance(m, dict) else ""
+
+
+def _msg_content(m: Any) -> Any:
+    """Raw content (NOT str-coerced): a non-str shape is failed closed below, not
+    silently stringified — str() would let a fragmented injection (content split
+    across a list/dict) dodge the scan while the original object still reaches
+    the sink."""
+    return m.get("content", "") if isinstance(m, dict) else m
+
+
+def vault_egress_decisions(messages: Any, *, origin: str,
+                           taint: Optional[Dict[str, Any]] = None,
+                           subsystem: str = VAULT_CANDIDATE) -> List[EgressDecision]:
+    """PURE: run each memory-role message through vault_scan → vault_gate_posture.
+
+    Returns one EgressDecision per input message, order preserved. Writes and
+    sends nothing (the caller owns the destination). Structurally-non-memory
+    roles (system/tool/reasoning) pass through as allow without scanning; every
+    other role is scanned (fail-safe). A non-str content shape on a scanned role
+    is failed closed to STAGE (unscannable → withheld). The content-free audit
+    for a background drop is emitted by vault_gate_posture itself, not here.
+    """
+    taint = taint or {}
+    out: List[EgressDecision] = []
+    for i, m in enumerate(list(messages or [])):
+        role = _msg_role(m)
+        content = _msg_content(m)
+        if role in _NON_MEMORY_ROLES:
+            out.append(EgressDecision(i, role, content, GateDecision(allow=True)))
+            continue
+        if not isinstance(content, str):
+            # Unscannable content shape (list/dict/None): fail closed. Withhold
+            # via STAGE rather than str()-scan a value whose original object
+            # would still reach the sink (the fragmented-injection dodge).
+            out.append(EgressDecision(i, role, content, GateDecision(
+                stage=True, message=_vault_stage_message("nicht scannbarer Inhaltstyp"))))
+            continue
+        block_ids, warn_ids, scanner_ok = vault_scan(content)
+        decision = vault_gate_posture(
+            subsystem, origin=origin, taint=taint,
+            block_ids=block_ids, warn_ids=warn_ids, scanner_ok=scanner_ok)
+        out.append(EgressDecision(i, role, content, decision))
+    return out
+
+
+def vault_egress_filter(messages: Any, *, origin: str,
+                        taint: Optional[Dict[str, Any]] = None
+                        ) -> Tuple[List[Any], List[EgressDecision]]:
+    """Convenience for a provider EGRESS filter (defense-in-depth on a durable
+    sink with NO owner-approval channel, e.g. a cloud provider).
+
+    Returns ``(kept, withheld)``: ``kept`` = the original message objects whose
+    gate decision is a clean ``allow`` (safe to persist); ``withheld`` = the
+    EgressDecisions that were blocked / dropped / staged and must NOT reach the
+    backend payload. This is the conservative, privacy-protective reading: a
+    scanner-dead / untrusted-inbound / special-category message resolves to
+    STAGE and is therefore withheld from the sink rather than sent. Pure — the
+    drop-audit already fired inside the gate. The future vault provider uses
+    vault_egress_decisions for the richer allow→commit / stage→STAGE routing.
+    """
+    msgs = list(messages or [])
+    decisions = vault_egress_decisions(msgs, origin=origin, taint=taint)
+    kept = [msgs[d.index] for d in decisions if d.decision.allow]
+    withheld = [d for d in decisions if not d.decision.allow]
+    return kept, withheld
