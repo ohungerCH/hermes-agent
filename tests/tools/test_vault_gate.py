@@ -206,6 +206,23 @@ def test_explicit_false_taint_commits():
     assert _posture("foreground", taint={"from_untrusted_inbound": False}).allow is True
 
 
+@pytest.mark.parametrize("bad", [None, "", "   ", 0, [], "maybe"])
+def test_present_but_ambiguous_taint_fails_closed_to_stage(bad):
+    # The second missing-field door: a key PRESENT with a falsey-non-False /
+    # ambiguous value (e.g. JSON null -> None from a serialized provenance field)
+    # must NOT fall open. Trusted only on an EXPLICIT False-like value.
+    d = _posture("background", taint={"from_untrusted_inbound": bad})
+    assert d.stage is True
+    assert d.allow is False and d.taint_marker == ""
+
+
+@pytest.mark.parametrize("ok", [False, "false", "no", "0", "off", "disabled", "FALSE"])
+def test_explicit_false_like_strings_commit(ok):
+    # Explicit False-like markers are trusted and COMMIT (comfort-first).
+    d = _posture("background", taint={"from_untrusted_inbound": ok})
+    assert d.allow is True and d.taint_marker == "retrieval_derived"
+
+
 # ---------------------------------------------------------------------------
 # Comfort-first: warn_ids NEVER block or stage (the security owner's C2 note)
 # ---------------------------------------------------------------------------

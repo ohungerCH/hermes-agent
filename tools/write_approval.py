@@ -558,6 +558,24 @@ def _vault_is_special_category(taint: Dict[str, Any]) -> bool:
     return str(taint.get("sensitivity", "")).strip().lower() == "special_category"
 
 
+def _vault_untrusted_capture(taint: Dict[str, Any]) -> bool:
+    """True unless the caller EXPLICITLY marked the capture trusted.
+
+    Untrusted-by-default on ALL missing-field doors, matching the durable column
+    `from_untrusted_inbound NOT NULL DEFAULT true` (ADR-0042:35): absent, None,
+    empty, or any ambiguous value → untrusted → STAGE. ONLY an explicit
+    False-like value (bool False or 'false'/'no'/'0'/'off'/'disabled') is
+    trusted. This closes both the absent-key AND the present-but-falsey-non-False
+    door (a serialized provenance field arriving as JSON null must not fall open).
+    """
+    v = taint.get("from_untrusted_inbound", True)
+    if v is False:
+        return False
+    if isinstance(v, str) and v.strip().lower() in {"false", "no", "0", "off", "disabled"}:
+        return False
+    return True
+
+
 def vault_scanner_ok() -> bool:
     """Functional health-probe of the injection scanner. NEVER a literal True.
 
@@ -675,13 +693,12 @@ def vault_gate_posture(subsystem: str, *, origin: str, taint: Dict[str, Any],
             "Sicherheits-Scanner nicht verfügbar"))
 
     # (3) Untrusted-inbound-derived capture → STAGE (auto_recall would re-inject
-    #     it without the owner = irreversible-by-autonomy). The default is
-    #     untrusted (True), matching the durable column's `from_untrusted_inbound
-    #     NOT NULL DEFAULT true` (ADR-0042:35, STUFE5_BUILD_SPEC:202/376): an
-    #     OMITTED taint key must fail CLOSED to STAGE, the same missing-field
-    #     trap the origin axis closes above. A genuinely clean owner capture
-    #     passes from_untrusted_inbound=False explicitly and still COMMITs.
-    if _vault_truthy(taint.get("from_untrusted_inbound", True)):
+    #     it without the owner = irreversible-by-autonomy). Untrusted-by-default
+    #     on EVERY missing-field door (absent / None / empty / ambiguous),
+    #     matching the durable column `from_untrusted_inbound NOT NULL DEFAULT
+    #     true` (ADR-0042:35). Only an explicit False-like value COMMITs — a
+    #     genuinely clean owner capture passes from_untrusted_inbound=False.
+    if _vault_untrusted_capture(taint):
         return GateDecision(stage=True, message=_vault_stage_message(
             "aus untrusted Eingang abgeleitet"))
 
