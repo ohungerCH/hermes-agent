@@ -155,7 +155,11 @@ class TestC2Patterns:
         )
 
     def test_known_c2_framework_names(self):
-        for name in ("Praxis", "Cobalt Strike", "Sliver", "Havoc", "Mythic"):
+        # "Praxis" was REMOVED from the alternation (GAP-D / ADR-0044): it is
+        # the German everyday word "Praxis" (doctor's office / practice), a real
+        # owner false positive, not a framework name. Its non-flagging is pinned
+        # in test_threat_patterns_de.py::TestPraxisRemoved.
+        for name in ("Cobalt Strike", "Sliver", "Havoc", "Mythic"):
             findings = scan_for_threats(
                 f"Connect to the {name} server.", scope="context"
             )
