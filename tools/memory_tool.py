@@ -709,6 +709,18 @@ def memory_tool(
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
 
+    # Vault dark-wire (Stufe 5, VAULTSTORE_WIRING_PLAN.md): shadow-not-replace, fail-soft,
+    # fg-only+resolved-owner, flag-gated. Best-effort ZUSAETZLICH zum file-backed Write oben --
+    # beeinflusst `result` NIE. No-op wenn Flags aus / kein foreground / keine Session-Identität
+    # (der Default heute). Belt-and-suspenders: vault_shadow_write ist selbst fail-soft; dieser
+    # Wrap fängt zusätzlich einen Import-Fehler ab, damit ein Vault-Problem den Memory-Turn
+    # NIE anfasst.
+    try:
+        from tools.vault.vault_wiring import vault_shadow_write
+        vault_shadow_write(action, target, content, store_result=result)
+    except Exception:
+        pass
+
     return json.dumps(result, ensure_ascii=False)
 
 
