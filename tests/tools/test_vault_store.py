@@ -13,7 +13,7 @@ Canon: ADR-0044 Stufe 2 (:193-227), ADR-0041 §G (:605, :674, :718), VAULTSTORE_
 import pytest
 
 from tools.vault import vault_store as vs
-from tools.vault.vault_store import MemoryWrite, VaultStore
+from tools.vault.vault_store import MemoryWrite, MemoryInvalidate, VaultStore
 
 
 # ---------------------------------------------------------------------------
@@ -23,20 +23,25 @@ from tools.vault.vault_store import MemoryWrite, VaultStore
 class FakeCursor:
     def __init__(self, conn):
         self._conn = conn
+        self.rowcount = -1   # wie manche Treiber: unbekannt bis nach execute
 
     def execute(self, sql, params=None):
         self._conn.executed.append((sql, params))
+        # §5b invalidate liest cur.rowcount nach dem UPDATE -> vom Conn konfigurierbar.
+        if "UPDATE public.memory_items" in sql:
+            self.rowcount = self._conn.update_rowcount
 
 
 class FakeConn:
     """Duck-typed DB-API-Connection. Zeichnet execute/commit/rollback auf."""
 
-    def __init__(self, *, fail_commit=False, fail_on_memory_insert=False):
+    def __init__(self, *, fail_commit=False, fail_on_memory_insert=False, update_rowcount=1):
         self.executed = []
         self.committed = False
         self.rolled_back = False
         self._fail_commit = fail_commit
         self._fail_on_memory_insert = fail_on_memory_insert
+        self.update_rowcount = update_rowcount   # betroffene Zeilen eines §5b-UPDATE
 
     def cursor(self):
         return FakeCursor(self)
@@ -425,3 +430,114 @@ def test_real_scanner_passes_benign():
     conn = FakeConn()
     res = _store(conn).write(_req(origin="foreground", source=vs.SOURCE_FOREGROUND_OWNER))
     assert res.status == vs.STATUS_WRITTEN and res.persisted is True
+
+
+# ---------------------------------------------------------------------------
+# (7) §5b invalidate() -- Tombstone/Supersede (UPDATE-only, RLS, graceful)
+# ---------------------------------------------------------------------------
+
+def _inv(**overrides):
+    base = dict(owner_id="owner-primary", tenant_id="tenant-a",
+                source_table="owner_memory", source_id="src-1", mode=vs.INVALIDATE_DELETE)
+    base.update(overrides)
+    return MemoryInvalidate(**base)
+
+
+def _invalidate_sql(conn):
+    for sql, params in conn.executed:
+        if "UPDATE public.memory_items" in sql:
+            return sql, params
+    return None, None
+
+
+def test_invalidate_delete_sets_deleted_at():
+    conn = FakeConn(update_rowcount=1)
+    res = _store(conn).invalidate(_inv(mode=vs.INVALIDATE_DELETE))
+    assert res.status == vs.STATUS_INVALIDATED
+    assert res.persisted is True and conn.committed is True
+    assert res.memory_item_written is True
+    sql, params = _invalidate_sql(conn)
+    assert "deleted_at = now()" in sql
+    # Natural-Key-Params in Reihenfolge (tenant, owner, source_table, source_id).
+    assert params == ("tenant-a", "owner-primary", "owner_memory", "src-1")
+
+
+def test_invalidate_supersede_sets_superseded_and_reindex():
+    conn = FakeConn(update_rowcount=1)
+    res = _store(conn).invalidate(_inv(mode=vs.INVALIDATE_SUPERSEDE))
+    assert res.status == vs.STATUS_INVALIDATED and res.persisted is True
+    sql, _ = _invalidate_sql(conn)
+    assert "superseded_at = now()" in sql and "reindex_state = 'superseded'" in sql
+
+
+def test_invalidate_missing_row_is_graceful_noop():
+    """Cold-Start / bereits invalidiert -> 0 Zeilen betroffen. KEIN Fehler: committet,
+    persisted=True, aber memory_item_written=False."""
+    conn = FakeConn(update_rowcount=0)
+    res = _store(conn).invalidate(_inv())
+    assert res.status == vs.STATUS_INVALIDATED
+    assert res.persisted is True and conn.committed is True
+    assert res.memory_item_written is False
+
+
+def test_invalidate_unknown_row_rowcount_unknown_treated_as_zero():
+    """rowcount == -1 (Treiber meldet 'unbekannt') -> defensiv als 0 (kein memory_item_written)."""
+    conn = FakeConn(update_rowcount=-1)
+    res = _store(conn).invalidate(_inv())
+    assert res.status == vs.STATUS_INVALIDATED and res.persisted is True
+    assert res.memory_item_written is False
+
+
+@pytest.mark.parametrize("bad", [{"mode": "erase"}, {"mode": ""}, {"source_table": ""},
+                                 {"source_id": ""}])
+def test_invalidate_failclosed_no_db(bad):
+    conn = FakeConn()
+    res = _store(conn).invalidate(_inv(**bad))
+    assert res.status == vs.STATUS_REFUSED
+    assert res.persisted is False
+    assert conn.executed == [] and conn.committed is False
+
+
+@pytest.mark.parametrize("tid,oid", [("", "o"), ("t", ""), ("bad id!", "o")])
+def test_invalidate_bad_anchor_refused_no_db(tid, oid):
+    conn = FakeConn()
+    res = _store(conn).invalidate(_inv(tenant_id=tid, owner_id=oid))
+    assert res.status == vs.STATUS_REFUSED and res.persisted is False
+    assert conn.executed == []
+
+
+def test_invalidate_commit_failure_is_error_and_rolls_back():
+    conn = FakeConn(fail_commit=True, update_rowcount=1)
+    res = _store(conn).invalidate(_inv())
+    assert res.status == vs.STATUS_ERROR
+    assert res.persisted is False
+    assert conn.committed is False and conn.rolled_back is True
+
+
+def test_invalidate_sets_rls_context_before_update():
+    """RLS-GUCs (set_config x2) VOR dem UPDATE -> cross-owner-Invalidierung unmöglich."""
+    conn = FakeConn(update_rowcount=1)
+    _store(conn).invalidate(_inv())
+    set_cfgs = [i for i, (s, _) in enumerate(conn.executed) if "set_config" in s]
+    upd = next(i for i, (s, _) in enumerate(conn.executed) if "UPDATE public.memory_items" in s)
+    assert len(set_cfgs) == 2 and upd > max(set_cfgs)
+
+
+def test_invalidate_no_content_scan_no_insert():
+    """invalidate schreibt NICHTS Neues: kein INSERT, nur set_config + UPDATE (kein Scan/Gate nötig)."""
+    conn = FakeConn(update_rowcount=1)
+    _store(conn).invalidate(_inv())
+    sqls = [s for s, _ in conn.executed]
+    assert not any("INSERT INTO" in s for s in sqls)
+    assert any("UPDATE public.memory_items" in s for s in sqls)
+
+
+def test_upsert_resurrection_is_owner_only():
+    """§5b Resurrection-Guard (SSOT-Form-Schutz; die echte ON-CONFLICT-Persistenz beweist psql
+    Szenario H). Ein foreground_owner-Re-Write löst deleted_at/superseded_at, jede andere source
+    NICHT -> das DO-UPDATE trägt beide Tombstone-Spalten owner-konditional."""
+    sql = " ".join(vs._MEMORY_ITEMS_INSERT.split())   # Whitespace normalisieren (Konkatenation)
+    assert "EXCLUDED.source = 'foreground_owner'" in sql
+    # owner-konditional, nicht bedingungslos gelöscht (sonst könnte Background Gelöschtes hochspülen).
+    assert "deleted_at = CASE WHEN EXCLUDED.source = 'foreground_owner' THEN NULL" in sql
+    assert "superseded_at = CASE WHEN EXCLUDED.source = 'foreground_owner' THEN NULL" in sql

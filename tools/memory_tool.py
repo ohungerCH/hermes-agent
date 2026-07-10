@@ -405,11 +405,17 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 }
 
+            old_entry = entries[idx]   # voller Alt-Eintrag (Vault §5b: Supersede-Ziel-Identität)
             entries[idx] = new_content
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry replaced.")
+        resp = self._success_response(target, "Entry replaced.")
+        # Interne Naht für den Vault-Shadow-Write (§5b): der volle Alt-Eintrag ist die stabile
+        # Identität (Content-Hash) der abzulösenden Zeile. memory_tool() poppt dies VOR json.dumps
+        # -> das Modell sieht es NIE.
+        resp["_vault_old_entry"] = old_entry
+        return resp
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
@@ -441,11 +447,14 @@ class MemoryStore:
                 # All identical -- safe to remove just the first
 
             idx = matches[0][0]
+            removed_entry = entries[idx]   # voller entfernter Eintrag (Vault §5b: Soft-Delete-Ziel)
             entries.pop(idx)
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry removed.")
+        resp = self._success_response(target, "Entry removed.")
+        resp["_vault_old_entry"] = removed_entry   # von memory_tool() vor json.dumps gepoppt
+        return resp
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
@@ -715,9 +724,14 @@ def memory_tool(
     # (der Default heute). Belt-and-suspenders: vault_shadow_write ist selbst fail-soft; dieser
     # Wrap fängt zusätzlich einen Import-Fehler ab, damit ein Vault-Problem den Memory-Turn
     # NIE anfasst.
+    #
+    # `_vault_old_entry` (§5b): replace/remove reichen den vollen Alt-Eintrag als interne Naht
+    # durch. ZUERST poppen (das Modell darf ihn NIE im Tool-Ergebnis sehen) -- auch wenn der
+    # Vault-Import/-Write scheitert, ist er dann schon entfernt.
+    old_entry = result.pop("_vault_old_entry", None) if isinstance(result, dict) else None
     try:
         from tools.vault.vault_wiring import vault_shadow_write
-        vault_shadow_write(action, target, content, store_result=result)
+        vault_shadow_write(action, target, content, store_result=result, old_entry=old_entry)
     except Exception:
         pass
 

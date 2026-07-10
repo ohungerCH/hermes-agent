@@ -88,6 +88,18 @@ VALID_SENSITIVITY = frozenset({
 LIFECYCLE_CANDIDATE = "candidate"    # NICHT recall-fähig bis Owner-Confirm
 LIFECYCLE_CONFIRMED = "confirmed"    # recall-fähig (Recall surft nur confirmed, ADR-0044:207)
 
+# Invalidierungs-Modi (§5b Edit/Delete-Propagation, WIRING_PLAN §5b). Ein foreground_owner-Write
+# leitet CONFIRMED ab -> ein Edit/Delete heilt sich NICHT durch Unrecall-Bleiben. Damit Vault +
+# MEMORY.md nicht divergieren, invalidiert der EINE Schreiber die alte Zeile über ihren Natural-Key:
+#   delete    -> deleted_at gesetzt (Owner löschte den Eintrag; Soft-Delete)
+#   supersede -> superseded_at + reindex_state='superseded' (Owner ersetzte "X"->"Y"; die alte Zeile
+#                wird abgelöst, die neue via write() separat eingefügt).
+# Beide Zustände sind vom Recall-Filter ausgeschlossen (s. _derive_provenance-Kontrakt). KEIN
+# superseded_by-Link (Provenienz-Kür, nicht recall-korrektheits-nötig -- Advisor 2026-07-09).
+INVALIDATE_DELETE = "delete"
+INVALIDATE_SUPERSEDE = "supersede"
+VALID_INVALIDATE_MODES = frozenset({INVALIDATE_DELETE, INVALIDATE_SUPERSEDE})
+
 # Traversierungs-Ziel der Roh-Schicht: eine memory_items-Zeile mit raw_bytes verweist via
 # source_table='object_metadata' + source_id (== object_key) auf ihre object_metadata-Zeile
 # (kohärente Naht, Codex-Cross-Review 2026-07-08). Ein raw-Write mit anderem source_table
@@ -117,6 +129,7 @@ STATUS_BLOCKED = "blocked"     # Gate-Ablehnung (Vordergrund-Injektion) -- owner
 STATUS_DROPPED = "dropped"     # Gate-Drop (Hintergrund-Injektion) -- Audit im Gate gefeuert
 STATUS_REFUSED = "refused"     # VaultStore-fail-closed (z.B. special-category ohne OD-11-Naht)
 STATUS_ERROR = "error"         # Persistenz fehlgeschlagen -> NIE als Erfolg melden (never-lost)
+STATUS_INVALIDATED = "invalidated"  # invalidate() committet (deleted_at/superseded_at gesetzt bzw. 0-Zeilen-No-op)
 
 
 @dataclass
@@ -184,6 +197,20 @@ class MemoryWrite:
     embedding_dimensions: int = EMBED_DIMENSIONS_DEFAULT
 
 
+@dataclass
+class MemoryInvalidate:
+    """Eine Invalidierungs-Anfrage (§5b): markiert EINE bestehende memory_items-Zeile über ihren
+    Natural-Key als gelöscht bzw. abgelöst. Trägt KEINEN Content (kein Injektions-Scan/Gate nötig --
+    es wird nichts Neues geschrieben, nur ein Lifecycle-Zustand auf einer schon owner-eigenen Zeile
+    gesetzt; die RLS-Isolation trägt die Sicherheit). ``source_id`` ist die STABILE Identität, mit
+    der die Zeile geschrieben wurde (bei owner_memory Phase-1 = Content-Hash des vollen Eintrags)."""
+    owner_id: str
+    tenant_id: str
+    source_table: str
+    source_id: str
+    mode: str                   # VALID_INVALIDATE_MODES
+
+
 # ---------------------------------------------------------------------------
 # SQL (parametrisiert, Spalten-SSOT)
 # ---------------------------------------------------------------------------
@@ -219,6 +246,15 @@ _EMBED_KEEP_COND = (
     "public.memory_items.source_hash IS NOT DISTINCT FROM EXCLUDED.source_hash "
     "AND EXCLUDED.redaction_state = 'applied' AND EXCLUDED.sanitization_state = 'applied'"
 )
+
+# §5b Resurrection-Guard (Review-Befund 2026-07-10): ein Upsert-Konflikt auf einen zuvor
+# invalidierten Natural-Key (Owner: add "X" -> remove "X" -> add "X") MUSS die Tombstones lösen,
+# sonst behält der Vault die alte Löschung -> MEMORY.md hat "X", der Vault sagt gelöscht (Under-
+# Recall = dieselbe §5b-Divergenz). ABER owner-only: nur ein foreground_owner-Re-Write darf
+# wiederbeleben. Ein späterer Background-/ingest-Write (source != foreground_owner) auf einen
+# owner-gelöschten Key darf NICHT resurrekten (sonst spült Auto-Capture Gelöschtes hoch). Der
+# VaultStore ist INV-3 auch für jene künftigen Aufrufer -> Guard JETZT setzen, nicht später.
+_OWNER_RESURRECT = "EXCLUDED.source = '" + SOURCE_FOREGROUND_OWNER + "'"
 _MEMORY_ITEMS_INSERT = (
     "INSERT INTO public.memory_items (" + ", ".join(_MEMORY_ITEMS_COLUMNS) + ") "
     "VALUES (" + ", ".join(["%s"] * len(_MEMORY_ITEMS_COLUMNS)) + ") "
@@ -235,6 +271,12 @@ _MEMORY_ITEMS_INSERT = (
     "  from_untrusted_inbound = EXCLUDED.from_untrusted_inbound,"
     "  device_id = EXCLUDED.device_id,"
     "  local_id = EXCLUDED.local_id,"
+    # §5b Resurrection (owner-only): ein foreground_owner-Re-Write auf einen invalidierten Key löst
+    # die Tombstones (Owner belebt seinen eigenen Eintrag wieder); jede andere source lässt sie stehen.
+    "  deleted_at = CASE WHEN " + _OWNER_RESURRECT +
+    "    THEN NULL ELSE public.memory_items.deleted_at END,"
+    "  superseded_at = CASE WHEN " + _OWNER_RESURRECT +
+    "    THEN NULL ELSE public.memory_items.superseded_at END,"
     # keep-Fall behält den BESTEHENDEN lifecycle -> promoviert NIE candidate->confirmed (bewusst:
     # Promotion ist der separate Confirm-Flow, nicht ein Re-Write). Nur Abwärts (-> candidate).
     "  lifecycle_status = CASE WHEN " + _EMBED_KEEP_COND +
@@ -254,6 +296,23 @@ _OBJECT_METADATA_INSERT = (
     "INSERT INTO public.object_metadata (" + ", ".join(_OBJECT_METADATA_COLUMNS) + ") "
     "VALUES (" + ", ".join(["%s"] * len(_OBJECT_METADATA_COLUMNS)) + ") "
     "ON CONFLICT ON CONSTRAINT objmeta_key_uq DO NOTHING"
+)
+
+# §5b Invalidierung -- zielgerichteter UPDATE über den Natural-Key (kein Insert, kein Upsert:
+# ein Upsert könnte bei Cold-Start eine Geister-Tombstone-Zeile INSERTen; ein UPDATE mit 0
+# betroffenen Zeilen ist der saubere No-op). Läuft unter der Composite-Anker-Policy (FOR ALL,
+# USING+WITH CHECK): USING filtert auf owner-eigene Zeilen -> cross-owner-Invalidierung unmöglich;
+# WITH CHECK verhindert Owner-Verschiebung (tenant/owner unverändert). Die WHERE-Zusatzklausel
+# (deleted_at/superseded_at IS NULL) macht Re-Invalidierung idempotent (0 Zeilen).
+_MEMORY_ITEMS_DELETE = (
+    "UPDATE public.memory_items SET deleted_at = now() "
+    "WHERE tenant_id = %s AND owner_id = %s AND source_table = %s AND source_id = %s "
+    "AND deleted_at IS NULL"
+)
+_MEMORY_ITEMS_SUPERSEDE = (
+    "UPDATE public.memory_items SET superseded_at = now(), reindex_state = 'superseded' "
+    "WHERE tenant_id = %s AND owner_id = %s AND source_table = %s AND source_id = %s "
+    "AND superseded_at IS NULL AND deleted_at IS NULL"
 )
 
 
@@ -377,6 +436,51 @@ class VaultStore:
         return self._persist(req, tenant, owner, lifecycle, resolved_source, untrusted,
                              sanitization_state=sanitization_state)
 
+    def invalidate(self, inv: MemoryInvalidate) -> WriteResult:
+        """§5b Edit/Delete-Propagation: markiert die bestehende Zeile (Natural-Key) als gelöscht
+        (deleted_at) bzw. abgelöst (superseded_at + reindex_state='superseded'). KEIN Scan/Gate:
+        es wird kein neuer Content geschrieben, nur ein Lifecycle-Zustand auf einer schon
+        owner-eigenen Zeile gesetzt (die RLS-Policy trägt die Isolation). Idempotent + graceful:
+        eine nie geschriebene / bereits invalidierte Zeile -> 0 Zeilen betroffen -> persisted=True,
+        memory_item_written=False (kein Fehler). persisted=True NUR nach erfolgreichem commit."""
+        # (0a) Anker fail-closed (wie write()): kein UPDATE mit halbem Anker.
+        try:
+            tenant = normalize_context_value(inv.tenant_id, "tenant_id")
+            owner = normalize_context_value(inv.owner_id, "owner_id")
+        except VaultContextError as e:
+            return WriteResult(status=STATUS_REFUSED, persisted=False, message=str(e))
+
+        # (0b) Modus + Identitäts-Felder fail-closed.
+        if inv.mode not in VALID_INVALIDATE_MODES:
+            return WriteResult(status=STATUS_REFUSED, persisted=False,
+                               message=f"unbekannter invalidate-mode '{inv.mode}'")
+        if not (isinstance(inv.source_table, str) and inv.source_table):
+            return WriteResult(status=STATUS_REFUSED, persisted=False, message="source_table fehlt")
+        if not (isinstance(inv.source_id, str) and inv.source_id):
+            return WriteResult(status=STATUS_REFUSED, persisted=False, message="source_id fehlt")
+
+        sql = _MEMORY_ITEMS_DELETE if inv.mode == INVALIDATE_DELETE else _MEMORY_ITEMS_SUPERSEDE
+        conn = self._connect()
+        affected = 0
+        try:
+            with vault_transaction(conn, tenant, owner) as cur:
+                cur.execute(sql, (tenant, owner, inv.source_table, inv.source_id))
+                # rowcount kann bei manchen Treibern -1 sein (unbekannt) -> defensiv auf 0.
+                rc = getattr(cur, "rowcount", 0)
+                affected = rc if isinstance(rc, int) and rc >= 0 else 0
+            conn.commit()
+        except BaseException as e:  # noqa: BLE001
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.error("vault invalidate failed (rolled back): %s", type(e).__name__)
+            return WriteResult(status=STATUS_ERROR, persisted=False,
+                               message="Vault-Invalidierung nicht committet -- bitte erneut versuchen")
+
+        return WriteResult(status=STATUS_INVALIDATED, persisted=True,
+                           memory_item_written=(affected > 0))
+
     # -- Validierung --------------------------------------------------------
     def _validate_vocab(self, req: MemoryWrite) -> str:
         """Gibt "" bei OK, sonst eine owner-freundliche Fehlermeldung (fail-closed)."""
@@ -406,8 +510,10 @@ class VaultStore:
     # -- Provenienz-Ableitung (die verlustfreie Inverse des Recall-Filters) --
     def _derive_provenance(self, d: GateDecision, req: MemoryWrite):
         """Bildet die Gate-Entscheidung auf durable Spalten ab. Der (deferred) Recall-Filter ist
-        WHERE lifecycle_status='confirmed' AND deleted_at IS NULL AND quarantined_at IS NULL;
-        dieser Write ist dessen exakte Inverse.
+        WHERE lifecycle_status='confirmed' AND deleted_at IS NULL AND quarantined_at IS NULL
+        AND superseded_at IS NULL; dieser Write ist dessen exakte Inverse. Die §5b-Invalidierung
+        (invalidate(): deleted_at bzw. superseded_at) setzt genau die hier ausgeschlossenen
+        Zustände -> eine editierte/gelöschte Zeile wird nicht mehr recall-fähig.
 
         Rückgabe: (lifecycle_status, resolved_source, from_untrusted_inbound).
         """

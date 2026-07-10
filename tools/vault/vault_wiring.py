@@ -116,33 +116,52 @@ def _source_table(target: str) -> str:
     return "user_profile" if target == "user" else "owner_memory"
 
 
+def _normalize_entry(text: Optional[str]) -> Optional[str]:
+    """MEMORY.md speichert Einträge GESTRIPPT (MemoryStore.add/replace strippen intern). Die
+    Natural-Key-Identität (Content-Hash) MUSS dieselbe Normalform hashen, sonst lokalisiert ein
+    späteres remove/replace die alte Zeile nicht (hash(un-gestrippt) != hash(gestrippt)). Deshalb
+    strippt der Vault-Rand JEDEN Eintrag EINMAL -- neuer Content wie Alt-Eintrag (letzterer kommt
+    schon gestrippt aus dem Store, strip ist dort idempotent)."""
+    return text.strip() if isinstance(text, str) else text
+
+
 def _phase1_source_id(content: str) -> str:
-    """PHASE-1 (WIRING_PLAN §5, NICHT enshrined): Content-Hash als source_id. ACHTUNG (Advisor
-    2026-07-09): dieser Aufrufer ist foreground_owner -> der VaultStore leitet CONFIRMED ab (NICHT
-    candidate). Folge: ein Memory-Edit "X"->"Y" erzeugt eine NEUE confirmed-Zeile hash(Y) und lässt
-    die ALTE confirmed-Zeile hash(X) verwaist (kein Supersede-Link); ein remove wird gar nicht
-    geshadowt -> Vault + MEMORY.md divergieren. Deshalb ist RECALL BLOCKIERT, bis Edit/Delete-
-    Propagation existiert (remove->soft-delete, replace->supersede-alt). Identischer Re-Write ist
-    idempotent (gleicher Natural-Key). Echte source_id-Factory bleibt Write-Path §5-offen."""
+    """PHASE-1 (WIRING_PLAN §5, NICHT enshrined): Content-Hash der GESTRIPPTEN Normalform als
+    source_id. Für owner_memory/user_profile IST der Eintrag seine Identität (kein externer Key) --
+    laut Advisor 2026-07-09 wahrscheinlich die permanente, nicht bloss Phase-1-Identität; die echte
+    Factory-Frage betrifft die ANDEREN source_tables (object_metadata/ingest). §5b (Edit/Delete-
+    Propagation) ist jetzt gebaut: replace supersediert hash(Alt-Eintrag) + fügt hash(Neu) ein,
+    remove soft-deletet hash(Alt-Eintrag). Lokalisierung beweisbar konsistent: jeder Write hasht
+    hash(voller gestrippter Eintrag), jede Invalidierung hasht dieselbe Form des Alt-Eintrags."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def vault_shadow_write(action: str, target: str, content: Optional[str],
-                       *, store_result: Any = None) -> Optional[str]:
+                       *, store_result: Any = None, old_entry: Optional[str] = None) -> Optional[str]:
     """Best-effort Shadow-Write in den Vault. Rückgabe rein informativ (Status-String oder None);
-    memory_tool IGNORIERT sie. NIE raise. No-op wenn: Pfad aus / kein add|replace / kein content /
-    file-Write nicht erfolgreich / origin!=foreground / keine Session-Identität.
+    memory_tool IGNORIERT sie. NIE raise. Deckt alle drei Mutationen (§5b):
+      add     -> neue Zeile schreiben (hash(neuer Content)).
+      replace -> alte Zeile supersedieren (hash(Alt-Eintrag)) + neue schreiben (hash(neuer Content)).
+      remove  -> alte Zeile soft-deleten (hash(Alt-Eintrag)); KEIN Insert.
 
-    remove wird bewusst NICHT geshadowt (Löschung = eigene Soft-Delete/Quarantäne-Semantik im
-    Vault, spätere Scheibe)."""
+    No-op wenn: Pfad aus / unbekannte Aktion / file-Write nicht erfolgreich / origin!=foreground /
+    keine Session-Identität / fehlender Content (add|replace) bzw. fehlender Alt-Eintrag
+    (replace|remove). Content + Alt-Eintrag werden EINMAL gestrippt (Hash-Konsistenz zur
+    MEMORY.md-Normalform, s. _normalize_entry)."""
     try:
         if not vault_path_active():
             return None
-        if action not in ("add", "replace"):
-            return None
-        if not content:
+        if action not in ("add", "replace", "remove"):
             return None
         if not _store_result_ok(store_result):
+            return None
+        content = _normalize_entry(content)
+        old_entry = _normalize_entry(old_entry)
+        # Content nur für add|replace nötig (der NEUE Eintrag); Alt-Eintrag nur für replace|remove
+        # (die zu invalidierende Zeile). Fehlt das Jeweilige -> fail-safe No-op.
+        if action in ("add", "replace") and not content:
+            return None
+        if action in ("replace", "remove") and not old_entry:
             return None
         try:
             from tools.write_approval import current_origin
@@ -154,7 +173,7 @@ def vault_shadow_write(action: str, target: str, content: Optional[str],
         if ident is None:
             return None
         tenant_id, owner_id = ident
-        return _do_vault_write(target, content, tenant_id, owner_id)
+        return _do_vault_op(action, target, content, old_entry, tenant_id, owner_id)
     except Exception as e:  # noqa: BLE001 -- fail-soft: der Live-Turn darf NIE hierdran hängen
         logger.warning("vault shadow-write übersprungen (fail-soft): %s", type(e).__name__)
         return None
@@ -180,13 +199,31 @@ def _build_request(target: str, content: str, tenant_id: str, owner_id: str):
     )
 
 
-def _do_vault_write(target: str, content: str, tenant_id: str, owner_id: str) -> str:
-    """PLUMBING = bauen + verwerfen (Dry-Run). WRITE = borrow conn -> VaultStore.write -> return conn.
-    Der Owner-Memory-Write ist reine Bedeutungs-Schicht (raw_bytes=None) -> kein crypto/object_sink."""
-    req = _build_request(target, content, tenant_id, owner_id)
+def _build_invalidate(target: str, old_entry: str, tenant_id: str, owner_id: str, mode: str):
+    """Baut die MemoryInvalidate für §5b: Natural-Key der abzulösenden/zu löschenden Zeile aus der
+    STABILEN Identität des vollen Alt-Eintrags (source_id == source_table-lokaler Content-Hash,
+    identisch zu dem, mit dem die Zeile via _build_request geschrieben wurde)."""
+    from tools.vault.vault_store import MemoryInvalidate
+    return MemoryInvalidate(
+        owner_id=owner_id, tenant_id=tenant_id,
+        source_table=_source_table(target),
+        source_id=_phase1_source_id(old_entry), mode=mode,
+    )
+
+
+def _do_vault_op(action: str, target: str, content: Optional[str], old_entry: Optional[str],
+                 tenant_id: str, owner_id: str) -> str:
+    """PLUMBING = bauen + verwerfen (Dry-Run). WRITE = borrow conn -> VaultStore-Op(s) -> return conn.
+    Der Owner-Memory-Write ist reine Bedeutungs-Schicht (raw_bytes=None) -> kein crypto/object_sink.
+
+    replace = supersede-ALT ZUERST, dann insert-NEU (privacy-safe: ein Crash dazwischen lässt die
+    alte Zeile abgelöst + die neue fehlend = Under-Recall; die umgekehrte Reihenfolge liesse bei
+    Crash BEIDE recall-fähig = die §5b-Divergenz). Scheitert der Supersede, wird NICHT eingefügt."""
+    from tools.vault.vault_store import INVALIDATE_DELETE, INVALIDATE_SUPERSEDE
 
     if not vault_write_enabled():
-        logger.info("vault PLUMBING dry-run: source_table=%s (kein durabler Write)", req.source_table)
+        logger.info("vault PLUMBING dry-run: action=%s source_table=%s (kein durabler Write)",
+                    action, _source_table(target))
         return "plumbing_dry_run"
 
     from tools.vault.vault_store import VaultStore
@@ -196,10 +233,23 @@ def _do_vault_write(target: str, content: str, tenant_id: str, owner_id: str) ->
     # deckt Blockieren, nicht nur Exceptions). Timeout -> Exception -> vom äusseren try gefangen.
     conn = pool.getconn(timeout=db_runtime.VAULT_GETCONN_TIMEOUT_S)
     try:
-        store = VaultStore(connect=lambda: conn)
-        result = store.write(req)
+        store = VaultStore(connect=lambda: conn)   # eine Connection, je Op eine eigene Txn+commit
+        if action == "add":
+            result = store.write(_build_request(target, content, tenant_id, owner_id))
+        elif action == "remove":
+            result = store.invalidate(
+                _build_invalidate(target, old_entry, tenant_id, owner_id, INVALIDATE_DELETE))
+        else:  # replace
+            inv = store.invalidate(
+                _build_invalidate(target, old_entry, tenant_id, owner_id, INVALIDATE_SUPERSEDE))
+            if not inv.persisted:
+                logger.warning(
+                    "vault replace: supersede-alt nicht committet (status=%s) -> insert-neu "
+                    "übersprungen (verhindert doppelte Recall-Zeile)", inv.status)
+                return inv.status
+            result = store.write(_build_request(target, content, tenant_id, owner_id))
     finally:
         pool.putconn(conn)  # reset_on_return='rollback' säubert die transaction-local GUCs
     if not result.persisted:
-        logger.warning("vault shadow-write nicht persistiert: status=%s", result.status)
+        logger.warning("vault shadow-op nicht persistiert: action=%s status=%s", action, result.status)
     return result.status

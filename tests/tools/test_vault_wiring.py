@@ -41,7 +41,9 @@ class FakePool:
 
 class FakeStore:
     last_req = None
+    last_inv = None
     raise_on_write = False
+    invalidate_persisted = True   # False -> Supersede-fail-Pfad (replace darf dann NICHT einfügen)
 
     def __init__(self, connect):
         self.connect = connect
@@ -53,11 +55,20 @@ class FakeStore:
         from tools.vault.vault_store import WriteResult, STATUS_WRITTEN
         return WriteResult(status=STATUS_WRITTEN, persisted=True, lifecycle_status="confirmed")
 
+    def invalidate(self, inv):
+        FakeStore.last_inv = inv
+        from tools.vault.vault_store import WriteResult, STATUS_INVALIDATED, STATUS_ERROR
+        if not FakeStore.invalidate_persisted:
+            return WriteResult(status=STATUS_ERROR, persisted=False)
+        return WriteResult(status=STATUS_INVALIDATED, persisted=True, memory_item_written=True)
+
 
 @pytest.fixture(autouse=True)
 def _reset_fakestore():
     FakeStore.last_req = None
+    FakeStore.last_inv = None
     FakeStore.raise_on_write = False
+    FakeStore.invalidate_persisted = True
     yield
 
 
@@ -121,13 +132,33 @@ def test_noop_when_path_inactive(monkeypatch):
     assert pool.borrowed == 0 and FakeStore.last_req is None
 
 
-def test_noop_on_remove(monkeypatch):
+def test_noop_on_remove_without_old_entry(monkeypatch):
+    """remove OHNE Alt-Eintrag (die zu löschende Identität fehlt) -> fail-safe No-op."""
     _flags(monkeypatch, write=True)
     _foreground(monkeypatch)
     _patch_write_backend(monkeypatch)
     with vw.vault_write_identity("t1", "o1"):
-        assert vw.vault_shadow_write("remove", "memory", "x", store_result=OK) is None
-    assert FakeStore.last_req is None
+        assert vw.vault_shadow_write("remove", "memory", None, store_result=OK) is None
+    assert FakeStore.last_req is None and FakeStore.last_inv is None
+
+
+def test_noop_on_replace_without_old_entry(monkeypatch):
+    """replace OHNE Alt-Eintrag -> kann nicht supersedieren -> No-op (statt Waise zu erzeugen)."""
+    _flags(monkeypatch, write=True)
+    _foreground(monkeypatch)
+    _patch_write_backend(monkeypatch)
+    with vw.vault_write_identity("t1", "o1"):
+        assert vw.vault_shadow_write("replace", "memory", "neu", store_result=OK) is None
+    assert FakeStore.last_req is None and FakeStore.last_inv is None
+
+
+def test_noop_on_unknown_action(monkeypatch):
+    _flags(monkeypatch, write=True)
+    _foreground(monkeypatch)
+    _patch_write_backend(monkeypatch)
+    with vw.vault_write_identity("t1", "o1"):
+        assert vw.vault_shadow_write("purge", "memory", "x", store_result=OK, old_entry="x") is None
+    assert FakeStore.last_req is None and FakeStore.last_inv is None
 
 
 def test_noop_without_content(monkeypatch):
@@ -217,6 +248,98 @@ def test_write_mode_user_target_maps_to_user_profile(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# §5b Edit/Delete-Propagation: remove -> invalidate-delete, replace -> supersede + insert
+# ---------------------------------------------------------------------------
+
+def test_remove_routes_to_invalidate_delete(monkeypatch):
+    _flags(monkeypatch, write=True)
+    _foreground(monkeypatch)
+    pool = _patch_write_backend(monkeypatch)
+    with vw.vault_write_identity("tenant-a", "owner-a"):
+        out = vw.vault_shadow_write("remove", "memory", None, store_result=OK, old_entry="Notiz X")
+    assert out == "invalidated"
+    assert FakeStore.last_req is None            # KEIN Insert bei remove
+    inv = FakeStore.last_inv
+    assert inv is not None
+    from tools.vault.vault_store import INVALIDATE_DELETE
+    assert inv.mode == INVALIDATE_DELETE
+    assert (inv.tenant_id, inv.owner_id, inv.source_table) == ("tenant-a", "owner-a", "owner_memory")
+    assert len(inv.source_id) == 64             # Content-Hash des Alt-Eintrags
+    assert pool.borrowed == 1 and pool.returned == 1
+
+
+def test_replace_supersedes_old_then_inserts_new(monkeypatch):
+    _flags(monkeypatch, write=True)
+    _foreground(monkeypatch)
+    _patch_write_backend(monkeypatch)
+    with vw.vault_write_identity("tenant-a", "owner-a"):
+        out = vw.vault_shadow_write("replace", "memory", "Neuer Text",
+                                    store_result=OK, old_entry="Alter Text")
+    assert out == "written"
+    from tools.vault.vault_store import INVALIDATE_SUPERSEDE
+    # Supersede-alt (auf Alt-Eintrag) UND Insert-neu (auf Neu-Content) liefen beide.
+    assert FakeStore.last_inv.mode == INVALIDATE_SUPERSEDE
+    assert FakeStore.last_req is not None
+    # verschiedene Natural-Keys (alte vs neue Zeile).
+    assert FakeStore.last_inv.source_id != FakeStore.last_req.source_id
+    assert FakeStore.last_req.source_id == vw._phase1_source_id("Neuer Text")
+    assert FakeStore.last_inv.source_id == vw._phase1_source_id("Alter Text")
+
+
+def test_replace_supersede_fail_skips_insert(monkeypatch):
+    """Scheitert der Supersede-alt, darf die neue Zeile NICHT eingefügt werden (sonst beide
+    recall-fähig = die §5b-Divergenz). Fail-soft: alte Zeile bleibt, MEMORY.md autoritativ."""
+    _flags(monkeypatch, write=True)
+    _foreground(monkeypatch)
+    _patch_write_backend(monkeypatch)
+    FakeStore.invalidate_persisted = False
+    with vw.vault_write_identity("tenant-a", "owner-a"):
+        out = vw.vault_shadow_write("replace", "memory", "Neuer Text",
+                                    store_result=OK, old_entry="Alter Text")
+    assert out == "error"                        # Supersede-Status durchgereicht
+    assert FakeStore.last_inv is not None and FakeStore.last_req is None   # kein Insert
+
+
+def test_remove_plumbing_dry_run_no_backend(monkeypatch):
+    _flags(monkeypatch, plumbing=True, write=False)
+    _foreground(monkeypatch)
+
+    def _boom():
+        raise AssertionError("Pool im PLUMBING-Dry-Run NICHT anfassen")
+    monkeypatch.setattr("tools.vault.db_runtime.get_vault_pool", _boom)
+    with vw.vault_write_identity("t", "o"):
+        assert vw.vault_shadow_write("remove", "memory", None,
+                                     store_result=OK, old_entry="X") == "plumbing_dry_run"
+
+
+def test_replace_plumbing_dry_run_no_backend(monkeypatch):
+    _flags(monkeypatch, plumbing=True, write=False)
+    _foreground(monkeypatch)
+
+    def _boom():
+        raise AssertionError("Pool im PLUMBING-Dry-Run NICHT anfassen")
+    monkeypatch.setattr("tools.vault.db_runtime.get_vault_pool", _boom)
+    with vw.vault_write_identity("t", "o"):
+        assert vw.vault_shadow_write("replace", "memory", "neu",
+                                     store_result=OK, old_entry="alt") == "plumbing_dry_run"
+
+
+def test_source_id_hash_consistency_across_whitespace(monkeypatch):
+    """Hash-Konsistenz-Beweis (MEMORY.md speichert gestrippt): der bei add gehashte Content und
+    der bei remove/replace gehashte Alt-Eintrag ergeben DENSELBEN Natural-Key trotz Whitespace ->
+    remove/replace lokalisieren die add-Zeile. Sonst wäre §5b wirkungslos."""
+    _flags(monkeypatch, write=True)
+    _foreground(monkeypatch)
+    _patch_write_backend(monkeypatch)
+    with vw.vault_write_identity("t", "o"):
+        vw.vault_shadow_write("add", "memory", "   Notiz Y   ", store_result=OK)
+        add_sid = FakeStore.last_req.source_id
+        vw.vault_shadow_write("remove", "memory", None, store_result=OK, old_entry="Notiz Y")
+        rem_sid = FakeStore.last_inv.source_id
+    assert add_sid == rem_sid == vw._phase1_source_id("Notiz Y")
+
+
+# ---------------------------------------------------------------------------
 # fail-soft: Backend-Fehler darf NIE hochblubbern
 # ---------------------------------------------------------------------------
 
@@ -289,8 +412,8 @@ def test_memory_tool_hook_is_fail_soft(monkeypatch):
 
     called = {}
 
-    def _boom(action, target, content, *, store_result=None):
-        called["args"] = (action, target, content, store_result)
+    def _boom(action, target, content, *, store_result=None, old_entry=None):
+        called["args"] = (action, target, content, store_result, old_entry)
         raise RuntimeError("vault kaputt")
 
     monkeypatch.setattr("tools.vault.vault_wiring.vault_shadow_write", _boom)
@@ -304,3 +427,28 @@ def test_memory_tool_hook_is_fail_soft(monkeypatch):
     # Der file-backed Write ist autoritativ + unbeeinflusst, trotz Vault-Exception.
     assert body.get("success") is True
     assert called["args"][0] == "add" and called["args"][3] == {"success": True, "target": "memory", "content": "hallo"}
+
+
+def test_memory_tool_hook_pops_vault_old_entry(monkeypatch):
+    """§5b: replace/remove reichen `_vault_old_entry` als interne Naht durch -> das Modell darf es
+    NIE im Tool-Ergebnis sehen (memory_tool poppt es vor json.dumps) + der Hook bekommt es."""
+    import tools.memory_tool as mt
+
+    seen = {}
+
+    def _capture(action, target, content, *, store_result=None, old_entry=None):
+        seen["old_entry"] = old_entry
+        seen["result_has_key"] = isinstance(store_result, dict) and "_vault_old_entry" in store_result
+
+    monkeypatch.setattr("tools.vault.vault_wiring.vault_shadow_write", _capture)
+
+    class FakeStore3:
+        def remove(self, target, old_text):
+            return {"success": True, "target": target, "entries": [], "_vault_old_entry": "Alter Eintrag"}
+
+    out = mt.memory_tool("remove", "memory", old_text="Alt", store=FakeStore3())
+    body = json.loads(out)
+    assert body.get("success") is True
+    assert "_vault_old_entry" not in body          # dem Modell NIE gezeigt
+    assert seen["old_entry"] == "Alter Eintrag"    # aber an den Shadow-Write gereicht
+    assert seen["result_has_key"] is False         # schon vor dem Hook-Call gepoppt
