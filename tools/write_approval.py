@@ -327,15 +327,17 @@ def evaluate_gate(subsystem: str, *, inline_summary: str = "",
                 blocked=True,
                 message="Memory write denied by user. The change was not saved.",
             )
-        # granted is None → prompt failed; fall through to staging.
+        # granted is None → prompt failed; fall through to the foreground-owner direct path.
 
-    return GateDecision(
-        stage=True,
-        message=(
-            "Staged for approval (memory.write_approval is on). "
-            "Not yet saved — review with /memory pending."
-        ),
-    )
+    # Memory + FOREGROUND + no interactive channel = the owner's own direct command over the
+    # gateway/trusted-surface. Owner-Doktrin (Bestätigung skaliert mit Kritikalität; eine
+    # harmlose, umkehrbare Notiz -> leichter Readback, KEIN stage-and-confirm; §5b Edit/Delete +
+    # Vault-Crypto-Shred machen es umkehrbar): direkt anwenden. Kohärent mit dem Vault-Gate
+    # (GAP-C: sauberer Vordergrund -> allow). SKILLS + BACKGROUND stagen weiter (oben returned);
+    # der Injektions-Scan (store.add _scan_memory_content) + das Vault-Gate (dark-wire) greifen
+    # unverändert. Erst dieser Direkt-Pfad lässt den Personal-Context-Vault mitschreiben (das
+    # Staging umging ihn -> Live-Smoke-Befund 2026-07-10, Owner-Entscheid "b").
+    return GateDecision(allow=True)
 
 
 def _interactive_approval_available() -> bool:

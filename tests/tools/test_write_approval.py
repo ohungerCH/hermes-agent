@@ -78,28 +78,32 @@ def test_memory_gate_off_allows_write(hermes_home):
     assert wa.pending_count("memory") == 0
 
 
-def test_memory_gate_on_no_interactive_stages(hermes_home):
-    # Gate on, no approval callback / not a gateway context → stage.
+def test_memory_gate_on_foreground_applies_directly(hermes_home):
+    # Owner-Doktrin (b, 2026-07-10): gate on + FOREGROUND (kein background, kein interaktiver
+    # Kanal) = der eigene Direkt-Befehl des Owners -> DIREKT anwenden, NICHT stagen (harmlos +
+    # umkehrbar -> leichter Readback). Background/Skills stagen weiter (eigene Tests).
     from tools.memory_tool import memory_tool, MemoryStore
     from tools import write_approval as wa
     _set_approval("memory", True)
     store = MemoryStore(); store.load_from_disk()
-    r = json.loads(memory_tool("add", "memory", "stage me", store=store))
-    assert r.get("staged") is True
-    assert r.get("pending_id")
-    # Not written to the live store yet.
-    assert store.memory_entries == []
-    pend = wa.list_pending("memory")
-    assert len(pend) == 1
-    assert pend[0]["id"] == r["pending_id"]
+    r = json.loads(memory_tool("add", "memory", "direct me", store=store))
+    assert r.get("staged") is not True
+    assert r.get("success") is True
+    assert "direct me" in store.memory_entries
+    assert wa.list_pending("memory") == []
 
 
-def test_memory_gate_on_then_apply(hermes_home):
+def test_memory_background_gate_on_then_apply(hermes_home, monkeypatch):
+    # Nach (b) staged NUR noch der Background-Pfad -> die stage-then-/memory-apply-Replay-Kette
+    # wird hier auf dem Background-Pfad geprüft (der weiter staged). Sichert zugleich die
+    # Scope-Invariante: Background-Memory-Writes stagen unverändert.
     from tools.memory_tool import memory_tool, MemoryStore, apply_memory_pending
     from tools import write_approval as wa
     _set_approval("memory", True)
+    monkeypatch.setattr(wa, "current_origin", lambda: "background_review")
     store = MemoryStore(); store.load_from_disk()
     r = json.loads(memory_tool("add", "user", "approved entry", store=store))
+    assert r.get("staged") is True
     pid = r["pending_id"]
     rec = wa.get_pending("memory", pid)
     result = apply_memory_pending(rec["payload"], store)
@@ -321,8 +325,10 @@ def test_memory_inline_deny_blocks(hermes_home, approval_callback_cleanup):
     assert wa.pending_count("memory") == 0  # denied, not staged
 
 
-def test_memory_inline_callback_error_stages(hermes_home, approval_callback_cleanup):
-    # If the prompt machinery fails, fall back to staging — never drop silently.
+def test_memory_inline_callback_error_applies(hermes_home, approval_callback_cleanup):
+    # Scheitert die Prompt-Maschinerie (granted None), fällt der FOREGROUND-Pfad auf den
+    # Owner-Direkt-Apply (b) durch -- nie stiller Drop, und (Vordergrund) kein erzwungenes
+    # Stage-and-Confirm. Der Eintrag landet direkt im Store.
     from tools.memory_tool import memory_tool, MemoryStore
     from tools.terminal_tool import set_approval_callback
     from tools import write_approval as wa
@@ -333,15 +339,16 @@ def test_memory_inline_callback_error_stages(hermes_home, approval_callback_clea
 
     store = MemoryStore(); store.load_from_disk()
     r = json.loads(memory_tool("add", "memory", "fallback fact", store=store))
-    assert r.get("staged") is True
-    assert wa.pending_count("memory") == 1
+    assert r.get("staged") is not True
+    assert r.get("success") is True
+    assert "fallback fact" in store.memory_entries
+    assert wa.pending_count("memory") == 0
 
 
-def test_gateway_context_stages_not_prompts(hermes_home, monkeypatch):
-    # A gateway session has no per-thread CLI callback; the dangerous-command
-    # /approve round-trip lives in the pending-queue machinery which the gate
-    # does not use. The gate must stage, never attempt an inline prompt
-    # (which would hit the input() fallback and silently deny).
+def test_gateway_context_applies_not_prompts(hermes_home, monkeypatch):
+    # Eine Gateway-Session hat keinen per-Thread-CLI-Callback. Nach Owner-Doktrin (b) wendet ein
+    # FOREGROUND-Owner-Memory-Write DIREKT an (nicht stagen) -- und darf entscheidend WEITERHIN
+    # nie einen Inline-Prompt versuchen (der träfe den input()-Fallback = stiller Deny).
     from tools.memory_tool import memory_tool, MemoryStore
     from tools import write_approval as wa
     _set_approval("memory", True)
@@ -349,9 +356,9 @@ def test_gateway_context_stages_not_prompts(hermes_home, monkeypatch):
 
     store = MemoryStore(); store.load_from_disk()
     r = json.loads(memory_tool("add", "memory", "gateway fact", store=store))
-    assert r.get("staged") is True
-    assert store.memory_entries == []
-    assert wa.pending_count("memory") == 1
+    assert r.get("staged") is not True
+    assert "gateway fact" in store.memory_entries
+    assert wa.pending_count("memory") == 0
 
 
 def test_skills_never_prompt_inline_even_with_callback(hermes_home, approval_callback_cleanup):
