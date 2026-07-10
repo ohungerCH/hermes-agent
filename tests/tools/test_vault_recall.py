@@ -285,6 +285,22 @@ def test_shadow_recall_store_unavailable_reports_false(monkeypatch):
 # memory_tool(action='recall') -- Ehrlichkeits-Rahmung
 # ---------------------------------------------------------------------------
 
+def test_agent_memory_branches_forward_query_and_limit():
+    """Regressions-Guard (Live-E2E-Befund 2026-07-10): der Agent-Loop hat ZWEI dedizierte
+    memory-Branches (agent/tool_executor.py + agent/agent_runtime_helpers.py), die memory_tool()
+    mit HARDCODIERTEN kwargs aufrufen -- ein PARALLELER Pfad neben der Registry-Lambda. Ein neuer
+    Param (query/limit für Recall) MUSS in BEIDEN mitgereicht werden, sonst droppt der Trusted-
+    Surface-/Agent-Pfad ihn stumm (die Unit-Tests + der Registry-Lambda-Pfad fangen das NICHT).
+    Source-Guard, weil die Branches Closures in einer grossen Dispatch-Funktion sind (kein leichter
+    Unit-Seam). Bricht der Guard: den neuen Param im _memory_tool(...)-Aufruf BEIDER Branches ergänzen."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    for rel in ("agent/tool_executor.py", "agent/agent_runtime_helpers.py"):
+        src = (root / rel).read_text(encoding="utf-8")
+        assert 'query=next_args.get("query")' in src, f"{rel}: memory-Branch reicht query NICHT durch"
+        assert 'limit=next_args.get("limit")' in src, f"{rel}: memory-Branch reicht limit NICHT durch"
+
+
 def test_tool_recall_requires_query():
     from tools.memory_tool import memory_tool
     out = json.loads(memory_tool("recall", target="memory", query=None, store=object()))
