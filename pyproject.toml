@@ -254,6 +254,16 @@ youtube = [
 # starlette==1.0.1 pinned for CVE-2026-48710 (BadHost) — fastapi pulls Starlette
 # transitively and pre-1.0.1 is the vulnerable range. See the mcp extra above.
 web = ["fastapi==0.133.1", "uvicorn[standard]==0.41.0", "starlette==1.0.1"]
+# Personal Context Vault write path — PostgreSQL driver + connection pool.
+# psycopg[binary] (v3) ships the bundled libpq inside the wheel, so no system
+# libpq is required in the image; pg17-compatible. psycopg-pool provides the
+# connection pool used by the guarded Vault writer (reset_on_return='rollback',
+# non-autocommit for transaction-local RLS GUCs). Unlike opt-in backends this is
+# infrastructure needed before/during the agent loop when the Vault seam is on,
+# and psycopg[binary] ships cross-platform manylinux/macOS/Windows wheels — so
+# it can't repeat the matrix/python-olm build breakage that got matrix pulled
+# from [all]. Hence it's eligible for [all] rather than lazy-install.
+vault = ["psycopg[binary]>=3.2,<4", "psycopg-pool>=3.2,<4"]
 all = [
   # Policy (2026-05-12): `[all]` includes only extras that genuinely
   # CAN'T be lazy-installed via `tools/lazy_deps.py` — i.e. things every
@@ -286,6 +296,7 @@ all = [
   "hermes-agent[google]",
   "hermes-agent[web]",
   "hermes-agent[youtube]",
+  "hermes-agent[vault]",
 ]
 
 [project.scripts]
