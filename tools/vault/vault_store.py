@@ -372,15 +372,22 @@ _MEMORY_ITEMS_SUPERSEDE = (
 # Aufruf, wiederverwendet in @@ + ts_rank -> ein einziger Query-Parameter). coalesce(...) MATCHT die
 # GIN-Index-Expression (memory_items_summary_fts) byte-genau, damit der Index nutzbar bleibt (kein
 # toter Index). from_untrusted_inbound wird PROJIZIERT (retrieval_derived-Marker am Modell-Rand),
-# NICHT gefiltert; sanitization_state wird NICHT gefiltert -- eine scanner-tote Zeile ist ohnehin
-# candidate (nicht confirmed), und ein Filter darauf würde Owners legitimes Security-Vokabular
-# kastrieren. Die Verteidigung gegen zitierte Injektion im Treffer ist der untrusted-Wrap am Rand,
-# NICHT der Ausschluss (Advisor 2026-07-10, #75 warn-vs-block).
+# NICHT gefiltert.
+# sanitization_state='applied' IST gefiltert (Advisor-Reconcile 2026-07-10): es kodiert die
+# Schreibseiten-Invariante confirmed⟹sanitisiert EXPLIZIT im Read, damit ein künftiger Confirm-
+# Promotion-Flow, der die Scanner-Liveness umgeht, keinen ungescannten Text via Recall hochspült.
+# Heute redundant (confirmed⟹applied gilt: scanner-tot -> stage -> candidate), aber der UNGEFILTERTE
+# FTS-Index heisst: die Query trägt die GANZE Korrektheit -- sie darf sich NICHT still auf den Write
+# verlassen (wie deleted/quarantined/superseded auch explizit stehen). KEINE Kastration: Security-
+# Vokabular ist warn-only (#75) -> scanner-gesund -> 'applied'; nur scanner-TOTE Zeilen sind 'pending'
+# (und die sind ohnehin candidate). Die Verteidigung gegen zitierte Injektion ist zusätzlich der
+# untrusted-Wrap am Rand.
 _MEMORY_ITEMS_RECALL = (
     "SELECT source_table, source_id, summary_redacted, created_at, sensitivity, from_untrusted_inbound "
     "FROM public.memory_items, websearch_to_tsquery('german', %s) AS q "
     "WHERE lifecycle_status = 'confirmed' "
     "AND deleted_at IS NULL AND quarantined_at IS NULL AND superseded_at IS NULL "
+    "AND sanitization_state = 'applied' "
     "AND to_tsvector('german', coalesce(summary_redacted, '')) @@ q "
     "ORDER BY ts_rank(to_tsvector('german', coalesce(summary_redacted, '')), q) DESC, created_at DESC "
     "LIMIT %s"

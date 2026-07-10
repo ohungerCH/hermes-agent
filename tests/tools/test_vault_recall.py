@@ -101,6 +101,8 @@ def test_recall_where_contract_is_complete():
     assert "deleted_at IS NULL" in sql
     assert "quarantined_at IS NULL" in sql
     assert "superseded_at IS NULL" in sql
+    # kodiert die Schreibseiten-Invariante confirmed=>sanitisiert explizit (Advisor-Reconcile)
+    assert "sanitization_state = 'applied'" in sql
     assert "@@ q" in sql and "websearch_to_tsquery('german', %s)" in sql
     # coalesce MATCHT die GIN-Index-Expression (kein toter Index)
     assert "coalesce(summary_redacted, '')" in sql
