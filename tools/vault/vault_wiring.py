@@ -294,8 +294,9 @@ def _entity_encode(text: str) -> str:
 def _wrap_recalled(summary: str, source_table: str, untrusted: bool) -> str:
     """Wrappt EIN zurückgeholtes Snippet als untrusted DATEN fürs Brain. Der Inhalt ist entity-
     encoded (strukturell neutralisiert); der Wrapper markiert klar, dass dies gemerkte DATEN sind,
-    keine Anweisungen. ``source_table`` ist kontrolliertes Vokabular (owner_memory/user_profile),
-    wird aber defensiv mitkodiert."""
+    keine Anweisungen. ``source_table`` ist beim Read gegen RECALLABLE_SOURCE_TABLES validiert
+    (VaultStore.recall) -> im Attribut nachweislich metazeichen-frei; defensiv trotzdem mitkodiert.
+    Der Inhalt (summary) wird NUR &,<,>-encoded (Text-Kontext); Quotes bleiben lesbar (kein Attribut)."""
     marker = "true" if untrusted else "false"
     return (f'{_RECALL_OPEN} source="{_entity_encode(source_table)}" untrusted_data="{marker}">'
             f"{_entity_encode(summary)}{_RECALL_CLOSE}")

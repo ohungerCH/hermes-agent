@@ -106,6 +106,14 @@ VALID_INVALIDATE_MODES = frozenset({INVALIDATE_DELETE, INVALIDATE_SUPERSEDE})
 # erzeugte einen Waisen (Objekt ohne traversierbare Meaning-Zeile) -> fail-closed (write()).
 SOURCE_TABLE_OBJECT = "object_metadata"
 
+# Recall-Read-Whitelist (defense-in-depth, Red-Team 2026-07-10): NUR diese source_tables dürfen aus
+# einem Read zurück ans (werkzeug-fähige) Brain. Die Werte sind beim Write kontrolliert, aber der
+# Read validiert UNABHÄNGIG -- eine DB-anomale / direkt-eingeschleuste source_table (z.B. mit
+# JSON-/Markup-Metazeichen) wird beim Recall verworfen (fail-safe skip + Log), damit ein DB-Bug NIE
+# zu einem Rückgabe-/Injektions-Bug wird. Kein Rival-Enum: exakt die owner_memory/user_profile-
+# Bedeutungs-Schichten + object_metadata-Traversierung.
+RECALLABLE_SOURCE_TABLES = frozenset({"owner_memory", "user_profile", SOURCE_TABLE_OBJECT})
+
 # Embedding-Achse: bge-m3-Pins (OD-1, 2026-07-07). embedding selbst bleibt beim Write NULL.
 EMBED_PROVIDER_DEFAULT = "local-bge-m3"
 EMBED_MODEL_DEFAULT = "BAAI/bge-m3"
@@ -581,13 +589,22 @@ class VaultStore:
             return RecallResult(status=STATUS_ERROR, available=False,
                                 message="Vault-Recall nicht ausführbar -- kein Gedächtnis-Zugriff")
 
-        items = [
-            RecallItem(
+        # Read-Whitelist (defense-in-depth): eine Zeile mit unerwartetem source_table wird NICHT ans
+        # Brain gereicht (fail-safe skip + Log) -- ein DB-Bug/Direkt-Insert kann so nie zu einem
+        # Rückgabe-Bug werden. Die verbleibenden Treffer bleiben nutzbar (kein Kill-des-ganzen-Recalls).
+        items = []
+        dropped = 0
+        for r in (rows or []):
+            if r[0] not in RECALLABLE_SOURCE_TABLES:
+                dropped += 1
+                continue
+            items.append(RecallItem(
                 source_table=r[0], source_id=r[1], summary=(r[2] or ""),
                 created_at=r[3], sensitivity=r[4], from_untrusted_inbound=bool(r[5]),
-            )
-            for r in (rows or [])
-        ]
+            ))
+        if dropped:
+            logger.warning("vault recall: %d Zeile(n) mit unbekanntem source_table verworfen "
+                           "(Read-Whitelist, defense-in-depth)", dropped)
         return RecallResult(
             status=(STATUS_RECALLED if items else STATUS_RECALL_EMPTY),
             items=items, available=True)
