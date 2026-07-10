@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 # damit eine langsame Query den Live-Turn nicht hängt (fail-soft-Vertrag deckt Blockieren, nicht
 # nur Exceptions -- Review 2026-07-09). Der connect-/pool-Warte-Timeout kommt aus getconn() (unten).
 _DSN_ENV = "VAULT_DB_DSN"
+# _FILE-Konvention (deckungsgleich mit POSTGRES_PASSWORD_FILE der vault-db): die DSN trägt das
+# DB-Passwort -> bevorzugt aus einer read-only gemounteten Secret-Datei lesen, NICHT als env-Literal
+# (env landet in docker-inspect/Crash-Dumps/Diag-Telemetrie). _FILE gewinnt, wenn gesetzt; sonst
+# Fallback auf die env-Variable (v.a. Tests). "Passwort NIE als Literal" (vault-db-compose-Kanon).
+_DSN_FILE_ENV = "VAULT_DB_DSN_FILE"
 
 # Kurzer getconn-Timeout: der Shadow-Write ist best-effort; kann der Pool nicht rasch eine
 # Connection liefern (vault-db tot/Pool erschöpft), wirft getconn(timeout=) statt bis 30s zu
@@ -48,15 +53,28 @@ def _configure(conn: Any) -> None:
     conn.autocommit = False
 
 
+def _read_dsn() -> str:
+    """DSN aus dem _FILE-Secret (bevorzugt) ODER der env-Variable (Fallback). Ist _FILE gesetzt aber
+    unlesbar -> VaultPoolUnavailable (fail-closed: NICHT still auf eine evtl. veraltete env fallen)."""
+    path = os.environ.get(_DSN_FILE_ENV, "").strip()
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError as exc:
+            raise VaultPoolUnavailable(f"{_DSN_FILE_ENV} nicht lesbar: {type(exc).__name__}") from exc
+    return os.environ.get(_DSN_ENV, "")
+
+
 def get_vault_pool() -> Any:
     """Lazy Modul-Singleton-Pool. Wirft VaultPoolUnavailable, wenn psycopg fehlt oder keine DSN
     gesetzt ist (Integrationsgrenze / kein Deploy)."""
     global _pool
     if _pool is not None:
         return _pool
-    dsn = os.environ.get(_DSN_ENV, "")
+    dsn = _read_dsn()
     if not dsn:
-        raise VaultPoolUnavailable(f"{_DSN_ENV} nicht gesetzt")
+        raise VaultPoolUnavailable(f"{_DSN_ENV}/{_DSN_FILE_ENV} nicht gesetzt")
     try:
         from psycopg_pool import ConnectionPool  # lazy: heute nicht im Engine-Trunk
     except Exception as exc:  # noqa: BLE001

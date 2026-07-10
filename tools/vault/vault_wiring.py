@@ -222,8 +222,12 @@ def _do_vault_op(action: str, target: str, content: Optional[str], old_entry: Op
     from tools.vault.vault_store import INVALIDATE_DELETE, INVALIDATE_SUPERSEDE
 
     if not vault_write_enabled():
-        logger.info("vault PLUMBING dry-run: action=%s source_table=%s (kein durabler Write)",
-                    action, _source_table(target))
+        # tenant/owner MIT loggen: der Override-Smoke (§7) beweist in PLUMBING, dass der am
+        # Schreibpunkt aufgelöste Anker IMMER die JWT-Session-Identität ist (NICHT client-
+        # beeinflussbar) -> der resolved owner MUSS beobachtbar sein. owner_id = stabiler
+        # Identifier (owner-primary), kein DLP-Inhalt; nur im flag-gegateten Dry-Run.
+        logger.info("vault PLUMBING dry-run: action=%s source_table=%s tenant=%s owner=%s "
+                    "(kein durabler Write)", action, _source_table(target), tenant_id, owner_id)
         return "plumbing_dry_run"
 
     from tools.vault.vault_store import VaultStore
