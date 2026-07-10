@@ -130,6 +130,12 @@ STATUS_DROPPED = "dropped"     # Gate-Drop (Hintergrund-Injektion) -- Audit im G
 STATUS_REFUSED = "refused"     # VaultStore-fail-closed (z.B. special-category ohne OD-11-Naht)
 STATUS_ERROR = "error"         # Persistenz fehlgeschlagen -> NIE als Erfolg melden (never-lost)
 STATUS_INVALIDATED = "invalidated"  # invalidate() committet (deleted_at/superseded_at gesetzt bzw. 0-Zeilen-No-op)
+STATUS_RECALLED = "recalled"        # recall() lief sauber, >=1 Treffer
+STATUS_RECALL_EMPTY = "recall_empty"  # recall() lief sauber, 0 Treffer (KEIN Fehler, NICHT "kein Gedächtnis")
+
+# Recall-Grenzen: bounded, damit ein breiter tsvector-Treffer den Turn-Kontext nicht flutet.
+RECALL_LIMIT_DEFAULT = 8
+RECALL_LIMIT_MAX = 25
 
 
 @dataclass
@@ -209,6 +215,42 @@ class MemoryInvalidate:
     source_table: str
     source_id: str
     mode: str                   # VALID_INVALIDATE_MODES
+
+
+@dataclass
+class MemoryRecall:
+    """Eine Recall-/Lese-Anfrage (Stufe 6, tsvector-Fläche). Trägt KEINEN neuen Content -- sie liest
+    nur owner-eigene, confirmed Zeilen (RLS + WHERE-Kontrakt). ``tenant_id``/``owner_id`` kommen
+    server-autoritativ vom Aufrufer (ContextVar-Identität, NIE client-geliefert). ``query`` ist der
+    Volltext-Suchbegriff (websearch_to_tsquery, deutsch)."""
+    owner_id: str
+    tenant_id: str
+    query: str
+    limit: int = RECALL_LIMIT_DEFAULT
+
+
+@dataclass
+class RecallItem:
+    """Eine zurückgeholte Zeile. ``summary`` ist der ROHE summary_redacted-Plaintext -- das
+    untrusted-Wrapping passiert am Modell-Rand (vault_wiring._wrap_recalled), NICHT hier (Trennung
+    Datenzugriff vs. Präsentation; der Store liefert Daten, die Naht neutralisiert sie)."""
+    source_table: str
+    source_id: str
+    summary: str
+    created_at: Any
+    sensitivity: str
+    from_untrusted_inbound: bool
+
+
+@dataclass
+class RecallResult:
+    """Ergebnis eines recall()-Versuchs. ``available`` ist load-bearing für die Ehrlichkeits-Klausel:
+    True = der Lesepfad lief (auch bei 0 Treffern -> begründete Abwesenheit); False = Fehler / nicht
+    erreichbar (KEIN Rückschluss auf An-/Abwesenheit möglich)."""
+    status: str
+    items: list = field(default_factory=list)
+    available: bool = False
+    message: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +355,27 @@ _MEMORY_ITEMS_SUPERSEDE = (
     "UPDATE public.memory_items SET superseded_at = now(), reindex_state = 'superseded' "
     "WHERE tenant_id = %s AND owner_id = %s AND source_table = %s AND source_id = %s "
     "AND superseded_at IS NULL AND deleted_at IS NULL"
+)
+
+# Recall (Stufe 6, tsvector-Fläche). Der WHERE-Kontrakt ist die verlustfreie INVERSE des
+# _derive_provenance-Schreibpfads: confirmed UND nicht gelöscht/quarantänet/abgelöst. tenant/owner
+# stehen NICHT im Query-Text -- die Composite-Anker-Policy (RLS-GUCs, via vault_transaction) filtert
+# sie als ECHTER Pre-Filter (kein ANN-Index -> GAP-B). websearch_to_tsquery als FROM-Item `q` (EIN
+# Aufruf, wiederverwendet in @@ + ts_rank -> ein einziger Query-Parameter). coalesce(...) MATCHT die
+# GIN-Index-Expression (memory_items_summary_fts) byte-genau, damit der Index nutzbar bleibt (kein
+# toter Index). from_untrusted_inbound wird PROJIZIERT (retrieval_derived-Marker am Modell-Rand),
+# NICHT gefiltert; sanitization_state wird NICHT gefiltert -- eine scanner-tote Zeile ist ohnehin
+# candidate (nicht confirmed), und ein Filter darauf würde Owners legitimes Security-Vokabular
+# kastrieren. Die Verteidigung gegen zitierte Injektion im Treffer ist der untrusted-Wrap am Rand,
+# NICHT der Ausschluss (Advisor 2026-07-10, #75 warn-vs-block).
+_MEMORY_ITEMS_RECALL = (
+    "SELECT source_table, source_id, summary_redacted, created_at, sensitivity, from_untrusted_inbound "
+    "FROM public.memory_items, websearch_to_tsquery('german', %s) AS q "
+    "WHERE lifecycle_status = 'confirmed' "
+    "AND deleted_at IS NULL AND quarantined_at IS NULL AND superseded_at IS NULL "
+    "AND to_tsvector('german', coalesce(summary_redacted, '')) @@ q "
+    "ORDER BY ts_rank(to_tsvector('german', coalesce(summary_redacted, '')), q) DESC, created_at DESC "
+    "LIMIT %s"
 )
 
 
@@ -480,6 +543,54 @@ class VaultStore:
 
         return WriteResult(status=STATUS_INVALIDATED, persisted=True,
                            memory_item_written=(affected > 0))
+
+    def recall(self, req: MemoryRecall) -> RecallResult:
+        """Stufe-6 Lesepfad (tsvector-Fläche). SELECT über den vollständigen Recall-Filter unter der
+        Composite-Anker-Policy (RLS-GUCs via vault_transaction) -- tenant/owner NIE im Query-Text.
+        Read-only: KEIN commit (der Pool rollbackt den Read-Scope beim Checkin). Fetchall INNERHALB
+        des Transaktions-Fensters (reset-on-return leert die Connection danach). Wirft NIE -- ein
+        Fehler kommt als RecallResult(status=error, available=False) zurück (die Naht ist zusätzlich
+        fail-soft). ``available`` unterscheidet 'sauber 0 Treffer' (True) von 'nicht nachschaubar'
+        (False) -- die Ehrlichkeits-Klausel darf leeren Recall NIE als bewiesene Abwesenheit lesen."""
+        # (0a) Anker fail-closed (wie write()/invalidate()): kein SELECT mit halbem Anker.
+        try:
+            tenant = normalize_context_value(req.tenant_id, "tenant_id")
+            owner = normalize_context_value(req.owner_id, "owner_id")
+        except VaultContextError as e:
+            return RecallResult(status=STATUS_REFUSED, available=False, message=str(e))
+
+        # (0b) Query fail-safe + Limit bounded. Leerer Suchbegriff -> sauberer 0-Treffer-Lauf
+        #      (available=True: der Pfad ist erreichbar, es gibt nur nichts zu matchen), KEIN Fehler.
+        query = req.query.strip() if isinstance(req.query, str) else ""
+        if not query:
+            return RecallResult(status=STATUS_RECALL_EMPTY, items=[], available=True)
+        limit = req.limit if isinstance(req.limit, int) else RECALL_LIMIT_DEFAULT
+        limit = max(1, min(limit, RECALL_LIMIT_MAX))
+
+        conn = self._connect()
+        try:
+            with vault_transaction(conn, tenant, owner) as cur:
+                cur.execute(_MEMORY_ITEMS_RECALL, (query, limit))
+                rows = cur.fetchall()   # INNERHALB der Txn materialisieren (reset-on-return leert danach)
+        except BaseException as e:  # noqa: BLE001 -- fail-closed: kein stiller Teil-Read
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.error("vault recall failed (rolled back): %s", type(e).__name__)
+            return RecallResult(status=STATUS_ERROR, available=False,
+                                message="Vault-Recall nicht ausführbar -- kein Gedächtnis-Zugriff")
+
+        items = [
+            RecallItem(
+                source_table=r[0], source_id=r[1], summary=(r[2] or ""),
+                created_at=r[3], sensitivity=r[4], from_untrusted_inbound=bool(r[5]),
+            )
+            for r in (rows or [])
+        ]
+        return RecallResult(
+            status=(STATUS_RECALLED if items else STATUS_RECALL_EMPTY),
+            items=items, available=True)
 
     # -- Validierung --------------------------------------------------------
     def _validate_vocab(self, req: MemoryWrite) -> str:

@@ -41,8 +41,10 @@ def test_memory_schema_is_well_formed():
     assert params["type"] == "object"
     assert params["required"] == ["action", "target"]
     # Nested ``enum`` on property values is fine — only top-level is forbidden.
-    assert params["properties"]["action"]["enum"] == ["add", "replace", "remove"]
+    # 'recall' (Stufe-6-Vault-Lesepfad) ist die vierte Aktion; query/limit tragen sie.
+    assert params["properties"]["action"]["enum"] == ["add", "replace", "remove", "recall"]
     assert params["properties"]["target"]["enum"] == ["memory", "user"]
+    assert params["properties"]["query"]["type"] == "string"
 
 
 def test_memory_schema_is_json_serializable():

@@ -264,3 +264,96 @@ def _do_vault_op(action: str, target: str, content: Optional[str], old_entry: Op
     if not result.persisted:
         logger.warning("vault shadow-op nicht persistiert: action=%s status=%s", action, result.status)
     return result.status
+
+
+# ---------------------------------------------------------------------------
+# Recall (Lese-Naht) -- die zweite (und einzige lesende) von memory_tool gerufene Funktion
+# ---------------------------------------------------------------------------
+# LOAD-BEARING (Advisor 2026-07-10): Recall läuft im Trusted-Surface-Brain, das WERKZEUGE hat.
+# Zurückgeholter Text, der "ignoriere alles, ruf Werkzeug X" sagt, ist ein echter Injektionsvektor --
+# auch in owner-authored Memory (der Owner kann eine zitierte Injektion bewusst gemerkt haben, z.B.
+# "merk dir diese verdächtige SMS: ..."). Verteidigung = STRUKTURELL WRAPPEN (als Daten, entity-
+# encoded), NICHT blocken: das Security-Vokabular des Owners (C2-Namen, Exfil-Beispiele) bleibt voll
+# abrufbar (#75 warn-vs-block). Der Wrap entity-encodet &,<,> -> ein Snippet kann den Delimiter NICHT
+# aufbrechen (Wrap-Escape-Klasse, Task #34; NICHT die _maybe_wrap_untrusted-Rohinterpolation).
+
+_RECALL_OPEN = "<recalled_memory"
+_RECALL_CLOSE = "</recalled_memory>"
+
+
+def _entity_encode(text: str) -> str:
+    """Neutralisiert die Markup-Struktur: &,<,> -> Entities. Ein zurückgeholtes Snippet kann damit
+    weder den Wrapper-Delimiter aufbrechen (Wrap-Escape) noch als Markup interpretiert werden. KEIN
+    Token-Match, KEIN Blocken -- reine strukturelle Neutralisierung (Owner-Inhalt bleibt lesbar).
+    Reihenfolge: & ZUERST (sonst würden die eingefügten &amp;/&lt;/&gt; doppelt kodiert)."""
+    if not isinstance(text, str):
+        return ""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _wrap_recalled(summary: str, source_table: str, untrusted: bool) -> str:
+    """Wrappt EIN zurückgeholtes Snippet als untrusted DATEN fürs Brain. Der Inhalt ist entity-
+    encoded (strukturell neutralisiert); der Wrapper markiert klar, dass dies gemerkte DATEN sind,
+    keine Anweisungen. ``source_table`` ist kontrolliertes Vokabular (owner_memory/user_profile),
+    wird aber defensiv mitkodiert."""
+    marker = "true" if untrusted else "false"
+    return (f'{_RECALL_OPEN} source="{_entity_encode(source_table)}" untrusted_data="{marker}">'
+            f"{_entity_encode(summary)}{_RECALL_CLOSE}")
+
+
+def vault_shadow_recall(query: str, target: str = "memory",
+                        *, limit: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """Best-effort Vault-Recall (tsvector-Fläche). Rückgabe = ein Modell-sicheres Dict oder None.
+    NIE raise. No-op (None) wenn: recall_enabled aus / leerer Query / origin!=foreground / keine
+    Session-Identität. Bei aktiver Naht + Fehler/toter DB: {available: False, ...} (fail-soft) --
+    NIE als "kein Gedächtnis": eine leere Trefferliste bei available=True heisst "nichts gemerkt
+    zu X"; available=False heisst "konnte nicht nachsehen". Jeder Treffer ist als untrusted DATEN
+    gewrappt (s. _wrap_recalled)."""
+    try:
+        if not vault_recall_enabled():
+            return None
+        if not isinstance(query, str) or not query.strip():
+            return None
+        try:
+            from tools.write_approval import current_origin
+            if current_origin() not in _FOREGROUND_ORIGINS:
+                return None
+        except Exception:
+            return None  # Herkunft unklar -> fail-closed kein Vault-Read
+        ident = get_vault_write_identity()
+        if ident is None:
+            return None
+        tenant_id, owner_id = ident
+        return _do_vault_recall(query, target, tenant_id, owner_id, limit)
+    except Exception as e:  # noqa: BLE001 -- fail-soft: der Live-Turn darf NIE hierdran hängen
+        logger.warning("vault shadow-recall übersprungen (fail-soft): %s", type(e).__name__)
+        return None
+
+
+def _do_vault_recall(query: str, target: str, tenant_id: str, owner_id: str,
+                     limit: Optional[int]) -> Dict[str, Any]:
+    """Führt den Recall aus: borrow conn -> VaultStore.recall -> return conn. Wrappt jeden Treffer
+    als untrusted Daten. ``available`` spiegelt RecallResult.available (Ehrlichkeits-Klausel)."""
+    from tools.vault.vault_store import VaultStore, MemoryRecall, RECALL_LIMIT_DEFAULT
+    from tools.vault import db_runtime
+    lim = limit if isinstance(limit, int) and limit > 0 else RECALL_LIMIT_DEFAULT
+    pool = db_runtime.get_vault_pool()
+    # getconn mit kurzem Timeout: ein toter Pool/DB darf den Live-Turn nicht hängen (fail-soft
+    # deckt Blockieren, nicht nur Exceptions). Timeout -> Exception -> vom äusseren try gefangen.
+    conn = pool.getconn(timeout=db_runtime.VAULT_GETCONN_TIMEOUT_S)
+    try:
+        store = VaultStore(connect=lambda: conn)
+        res = store.recall(MemoryRecall(
+            owner_id=owner_id, tenant_id=tenant_id, query=query, limit=lim))
+    finally:
+        pool.putconn(conn)  # reset_on_return='rollback' säubert die Read-Txn + transaction-local GUCs
+    if not res.available:
+        return {"available": False, "matches": [], "reason": res.status}
+    matches = [
+        {
+            "source": it.source_table,
+            "content": _wrap_recalled(it.summary, it.source_table, it.from_untrusted_inbound),
+        }
+        for it in res.items
+    ]
+    return {"available": True, "matches": matches, "count": len(matches)}
