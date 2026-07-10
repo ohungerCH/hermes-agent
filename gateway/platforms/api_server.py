@@ -1942,6 +1942,11 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             enabled_toolsets_override=direct_toolsets or None,
             gateway_session_key=gateway_session_key,
+            # Vault-Schreib-Identität (§5c): server-autoritativ aus der Trusted-Surface-Session,
+            # client-unfälschbar. NUR dieser Pfad hat einen aufgelösten Owner -> nur er speist den
+            # dark-wire; alle anderen _run_agent-Aufrufer lassen die Defaults None = No-op.
+            vault_tenant_id=identity.tenant_id,
+            vault_owner_id=identity.owner_id,
         )
         effective_session_id = (
             result.get("session_id") if isinstance(result, dict) else session_id
@@ -4284,6 +4289,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        vault_tenant_id: Optional[str] = None,
+        vault_owner_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4307,6 +4314,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_key=gateway_session_key or session_id or "",
                 session_id=session_id or "",
             )
+            # Vault-Schreib-Identität (Live-Scheibe Teil 3, §5c): der dark-wire (tools/vault/
+            # vault_wiring.py) liest die server-autoritative (tenant_id, owner_id) über eine
+            # ContextVar am memory_tool-Aufrufpunkt. ContextVars propagieren NICHT über die
+            # run_in_executor-Grenze -> die Identität MUSS hier INNEN im Executor-Thread gesetzt
+            # werden (gleicher Thread wie agent.run_conversation -> memory_tool), gespiegelt zum
+            # session_vars-Muster. None/leer -> set_vault_write_identity macht No-op (fail-closed).
+            from tools.vault.vault_wiring import (
+                reset_vault_write_identity,
+                set_vault_write_identity,
+            )
+
+            vault_tok = set_vault_write_identity(vault_tenant_id, vault_owner_id)
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -4339,6 +4358,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     result["session_id"] = _eff_sid
                 return result, usage
             finally:
+                reset_vault_write_identity(vault_tok)
                 clear_session_vars(tokens)
 
         return await loop.run_in_executor(None, _run)
