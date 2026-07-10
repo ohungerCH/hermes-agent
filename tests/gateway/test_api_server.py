@@ -990,6 +990,167 @@ class TestCapabilitiesEndpoint:
             )
             assert rejected.status == 401
 
+    @pytest.mark.asyncio
+    async def test_trusted_surface_session_describe_adds_server_authoritative_research_projection(
+        self,
+        tmp_path,
+    ):
+        token = jwt.encode(
+            {
+                "surface": "trusted_surface",
+                "principal_id": "owner:owner1",
+                "role": "owner",
+                "workspace_id": "private",
+                "tenant_id": "tenant-001",
+                "user_id": "user:owner1",
+                "owner_id": "owner1",
+                "device_id": "devA",
+                "auth_strength": "biometric_step_up",
+                "allowed_toolsets": [],
+                "allowed_capabilities": ["session.describe"],
+            },
+            "trusted-signing-key",
+            algorithm="HS256",
+        )
+        cron_root = tmp_path / "cron"
+        output_root = cron_root / "output"
+        output_root.mkdir(parents=True)
+        (cron_root / "enqueue").mkdir()
+        running_dir = output_root / "job-running"
+        running_dir.mkdir()
+        (running_dir / "_progress.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "job-running",
+                    "phase": "gathering",
+                    "note": "Recherche gestartet.",
+                }
+            ),
+            encoding="utf-8",
+        )
+        ready_dir = output_root / "job-ready"
+        ready_dir.mkdir()
+        (ready_dir / "result.md").write_text("# done\n", encoding="utf-8")
+        acked_dir = output_root / "job-acked"
+        acked_dir.mkdir()
+        (acked_dir / "result.md").write_text("# acked\n", encoding="utf-8")
+        unknown_dir = output_root / "job-unknown"
+        unknown_dir.mkdir()
+        (unknown_dir / "result.md").write_text("# unknown\n", encoding="utf-8")
+        outstanding_file = tmp_path / "research_outstanding.jsonl"
+        outstanding_file.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "job_id": "job-ready",
+                            "event": "announce",
+                            "ts": "2026-07-02T11:05:00Z",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "job_id": "job-acked",
+                            "event": "announce",
+                            "ts": "2026-07-02T11:06:00Z",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "job_id": "job-acked",
+                            "event": "ack",
+                            "ts": "2026-07-02T11:07:00Z",
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (cron_root / "research_index.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "job_id": "job-running",
+                        "title": "Android Accessibility Runtime",
+                        "created_at": "2026-07-02T10:00:00Z",
+                    },
+                    {
+                        "job_id": "job-ready",
+                        "title": "Notification Listener Recovery",
+                        "created_at": "2026-07-02T11:00:00Z",
+                    },
+                    {
+                        "job_id": "job-acked",
+                        "title": "Bluetooth Recovery",
+                        "created_at": "2026-07-02T11:30:00Z",
+                    },
+                    {
+                        "job_id": "job-unknown",
+                        "title": "Fallback Recovery",
+                        "created_at": "2026-07-02T11:40:00Z",
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "key": "sk-untrusted",
+                    "trusted_surface": {
+                        "enabled": True,
+                        "signing_key": "trusted-signing-key",
+                    },
+                },
+            )
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "RESEARCH_ENQUEUE_DIR": str(cron_root / "enqueue"),
+                "RESEARCH_INDEX": str(cron_root / "research_index.json"),
+                "RESEARCH_OUTPUT_DIR": str(output_root),
+                "JARVIS_RESEARCH_OUTSTANDING_FILE": str(outstanding_file),
+            },
+            clear=False,
+        ):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                ok = await cli.get(
+                    "/api/trusted-surface/session/describe",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert ok.status == 200
+                data = await ok.json()
+
+        projection = data["server_task_projection"]
+        assert projection["status"] == "available"
+        assert projection["projection_kind"] == "research_jobs_v1"
+        assert projection["scope"] == "research.request only"
+        assert [task["job_id"] for task in projection["tasks"]] == [
+            "job-unknown",
+            "job-ready",
+            "job-running",
+        ]
+        assert projection["tasks"][0]["state"] == "result_ready"
+        assert projection["tasks"][0]["title"] == "Fallback Recovery"
+        assert projection["tasks"][0]["outstanding_state"] == "unknown"
+        assert projection["tasks"][1]["state"] == "result_ready"
+        assert projection["tasks"][1]["title"] == "Notification Listener Recovery"
+        assert projection["tasks"][1]["outstanding_state"] == "open"
+        assert (
+            projection["tasks"][1]["outstanding_state_updated_at"]
+            == "2026-07-02T11:05:00Z"
+        )
+        assert projection["tasks"][2]["state"] == "running"
+        assert projection["tasks"][2]["phase"] == "gathering"
+        assert projection["tasks"][2]["created_at"] == "2026-07-02T10:00:00Z"
+        assert "outstanding_state" not in projection["tasks"][2]
+        assert all(task["job_id"] != "job-acked" for task in projection["tasks"])
+
 
 # ---------------------------------------------------------------------------
 # /v1/skills and /v1/toolsets endpoints

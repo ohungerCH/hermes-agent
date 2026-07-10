@@ -98,6 +98,7 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+TRUSTED_SURFACE_RESEARCH_PROJECTION_LIMIT = 5
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -118,6 +119,165 @@ _TRUSTED_SURFACE_GERMAN_MEMORY_REQUEST_MARKERS = (
     "speicher das",
     "erinnere dich",
 )
+
+
+def _normalize_trusted_surface_projection_text(
+    value: Any,
+    *,
+    max_len: int = 160,
+) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    return text.replace("\r", " ").replace("\n", " ")[:max_len]
+
+
+def _trusted_surface_research_projection_paths() -> tuple[Path, Path]:
+    index_path = os.getenv("RESEARCH_INDEX", "").strip()
+    output_dir = os.getenv("RESEARCH_OUTPUT_DIR", "").strip()
+    if index_path and output_dir:
+        return Path(index_path), Path(output_dir)
+
+    enqueue_dir = os.getenv("RESEARCH_ENQUEUE_DIR", "").strip()
+    cron_root = Path(enqueue_dir).parent if enqueue_dir else Path("/opt/data/cron")
+    return (
+        Path(index_path) if index_path else cron_root / "research_index.json",
+        Path(output_dir) if output_dir else cron_root / "output",
+    )
+
+
+def _trusted_surface_research_outstanding_path() -> Path:
+    outstanding_path = os.getenv("JARVIS_RESEARCH_OUTSTANDING_FILE", "").strip()
+    if outstanding_path:
+        return Path(outstanding_path)
+    return Path("/var/lib/jarvis-bridge/research_outstanding.jsonl")
+
+
+def _load_trusted_surface_research_outstanding_truth() -> Dict[str, Dict[str, str]]:
+    states: Dict[str, Dict[str, str]] = {}
+    outstanding_path = _trusted_surface_research_outstanding_path()
+    try:
+        raw = outstanding_path.read_text(encoding="utf-8")
+    except OSError:
+        return states
+
+    for line in raw.splitlines():
+        trimmed = line.strip()
+        if not trimmed:
+            continue
+        try:
+            entry = json.loads(trimmed)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        job_id = _normalize_trusted_surface_projection_text(
+            entry.get("job_id"),
+            max_len=64,
+        )
+        if not job_id:
+            continue
+        event = _normalize_trusted_surface_projection_text(
+            entry.get("event"),
+            max_len=16,
+        )
+        if event == "announce":
+            state = "open"
+        elif event == "ack":
+            state = "acked"
+        else:
+            continue
+        normalized: Dict[str, str] = {"outstanding_state": state}
+        updated_at = _normalize_trusted_surface_projection_text(
+            entry.get("ts"),
+            max_len=64,
+        )
+        if updated_at:
+            normalized["outstanding_state_updated_at"] = updated_at
+        states[job_id] = normalized
+    return states
+
+
+def _load_trusted_surface_server_task_projection() -> Dict[str, Any]:
+    projection: Dict[str, Any] = {
+        "status": "empty",
+        "projection_kind": "research_jobs_v1",
+        "scope": "research.request only",
+        "tasks": [],
+    }
+    index_path, output_dir = _trusted_surface_research_projection_paths()
+    outstanding_truth = _load_trusted_surface_research_outstanding_truth()
+    try:
+        raw = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return projection
+
+    if isinstance(raw, dict):
+        entries = raw.get("entries")
+        raw_entries = entries if isinstance(entries, list) else []
+    elif isinstance(raw, list):
+        raw_entries = raw
+    else:
+        raw_entries = []
+
+    tasks: List[Dict[str, Any]] = []
+    seen_job_ids: set[str] = set()
+    for entry in reversed(raw_entries):
+        if not isinstance(entry, dict):
+            continue
+        job_id = _normalize_trusted_surface_projection_text(entry.get("job_id"), max_len=64)
+        if not job_id or job_id in seen_job_ids:
+            continue
+        seen_job_ids.add(job_id)
+        title = _normalize_trusted_surface_projection_text(entry.get("title"))
+        created_at = _normalize_trusted_surface_projection_text(entry.get("created_at"), max_len=64)
+        state = "queued"
+        phase = ""
+        job_dir = output_dir / job_id
+        try:
+            has_markdown_output = job_dir.is_dir() and any(
+                child.is_file() and child.suffix.lower() == ".md"
+                for child in job_dir.iterdir()
+            )
+        except OSError:
+            has_markdown_output = False
+        if has_markdown_output:
+            state = "result_ready"
+        else:
+            try:
+                progress = json.loads((job_dir / "_progress.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                progress = {}
+            if isinstance(progress, dict):
+                phase = _normalize_trusted_surface_projection_text(
+                    progress.get("phase"),
+                    max_len=64,
+                )
+            if phase:
+                state = "running"
+        task: Dict[str, Any] = {
+            "job_id": job_id,
+            "title": title,
+            "state": state,
+        }
+        if created_at:
+            task["created_at"] = created_at
+        if phase:
+            task["phase"] = phase
+        if state == "result_ready":
+            task.update(outstanding_truth.get(job_id, {"outstanding_state": "unknown"}))
+            if task.get("outstanding_state") == "acked":
+                continue
+        tasks.append(task)
+        if len(tasks) >= TRUSTED_SURFACE_RESEARCH_PROJECTION_LIMIT:
+            break
+
+    if tasks:
+        projection["status"] = "available"
+        projection["tasks"] = tasks
+    return projection
 _TRUSTED_SURFACE_ENGLISH_MEMORY_REQUEST_MARKERS = (
     "remember this",
     "remember that",
@@ -1432,7 +1592,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=401,
             )
 
-        return web.json_response(identity.to_dict())
+        payload = identity.to_dict()
+        # The first server-authoritative owner task projection is intentionally
+        # narrow: only research jobs backed by worker-authored index/progress
+        # state. Session-local docs/m365/docs.write receipts stay out of this view.
+        payload["server_task_projection"] = _load_trusted_surface_server_task_projection()
+        return web.json_response(payload)
 
     def _authenticate_trusted_surface_request(
         self,
