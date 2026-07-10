@@ -245,3 +245,92 @@ def test_vault_reindex_owner_trigger(monkeypatch):
                         lambda t, o, connect, max_rows=500: rx.ReindexResult(status="reindexed", embedded=3, scanned=3))
     out = vw.vault_reindex_owner("t1", "o1")
     assert out["status"] == "reindexed" and out["embedded"] == 3 and out["available"] is True
+
+
+# ---------------------------------------------------------------------------
+# Hybrid-Recall (tsvector-Boden + knn-Ranking, union+dedup)
+# ---------------------------------------------------------------------------
+
+class _HybridCursor:
+    def __init__(self, conn):
+        self._conn = conn; self._last = None
+    def execute(self, sql, params=None):
+        self._conn.executed.append((sql, params)); self._last = sql
+    def fetchall(self):
+        if "embedding <=>" in (self._last or ""):
+            return list(self._conn.knn_rows)
+        if "websearch_to_tsquery" in (self._last or ""):
+            return list(self._conn.ts_rows)
+        return []
+
+
+class _HybridConn:
+    def __init__(self, knn_rows=(), ts_rows=()):
+        self.executed = []; self.knn_rows = list(knn_rows); self.ts_rows = list(ts_rows)
+    def cursor(self):
+        return _HybridCursor(self)
+    def rollback(self): pass
+    def commit(self): pass
+
+
+def _row(sid, summary="x"):
+    return ("owner_memory", sid, summary, "2026-07-11T00:00:00Z", "personal_low", False)
+
+
+def test_recall_hybrid_merges_knn_and_tsvector(monkeypatch):
+    """Hybrid: knn zuerst (semantisch), dann tsvector-only (neue/un-embeddete Zeilen); dedup source_id."""
+    conn = _HybridConn(knn_rows=[_row("a"), _row("b")], ts_rows=[_row("b"), _row("c")])
+    monkeypatch.setattr("tools.vault.embed_client.embed_texts", lambda texts: ec.EmbedResult(
+        "local-bge-m3", "BAAI/bge-m3", "v1", 1024, [[0.02] * 1024]))
+    res = VaultStore(connect=lambda: conn).recall(
+        MemoryRecall(owner_id="o1", tenant_id="t1", query="kaffee", mode="hybrid"))
+    ids = [it.source_id for it in res.items]
+    assert ids == ["a", "b", "c"]          # knn a,b zuerst; b dedupt; c (tsvector-only) gefangen
+    assert res.mode_used == "hybrid" and res.available is True
+    # beide SELECTs liefen (KNN + tsvector)
+    sqls = " ".join(s for (s, p) in conn.executed)
+    assert "embedding <=>" in sqls and "websearch_to_tsquery" in sqls
+
+
+def test_recall_hybrid_tsvector_only_when_embed_down(monkeypatch):
+    """Server weg (embed None) -> nur tsvector-Boden, KEIN KNN-SELECT, mode_used='hybrid_tsvector_only'."""
+    conn = _HybridConn(knn_rows=[_row("a")], ts_rows=[_row("c")])
+    monkeypatch.setattr("tools.vault.embed_client.embed_texts", lambda texts: None)
+    res = VaultStore(connect=lambda: conn).recall(
+        MemoryRecall(owner_id="o1", tenant_id="t1", query="kaffee", mode="hybrid"))
+    ids = [it.source_id for it in res.items]
+    assert ids == ["c"]                    # NUR tsvector (neue Zeile sichtbar), knn nicht gelaufen
+    assert res.mode_used == "hybrid_tsvector_only"
+    sqls = " ".join(s for (s, p) in conn.executed)
+    assert "embedding <=>" not in sqls and "websearch_to_tsquery" in sqls
+
+
+def test_recall_hybrid_new_row_never_invisible(monkeypatch):
+    """Kern-Garantie: eine NEUE, noch nicht embeddete Zeile (nur im tsvector-Ergebnis, NICHT im knn)
+    wird von hybrid gefunden -- der KNN-`embedding IS NOT NULL`-Filter kann sie nicht verstecken."""
+    conn = _HybridConn(knn_rows=[], ts_rows=[_row("neu")])   # knn findet nichts (kein Vektor), tsvector schon
+    monkeypatch.setattr("tools.vault.embed_client.embed_texts", lambda texts: ec.EmbedResult(
+        "local-bge-m3", "BAAI/bge-m3", "v1", 1024, [[0.02] * 1024]))
+    res = VaultStore(connect=lambda: conn).recall(
+        MemoryRecall(owner_id="o1", tenant_id="t1", query="kaffee", mode="hybrid"))
+    assert [it.source_id for it in res.items] == ["neu"] and res.mode_used == "hybrid"
+
+
+def test_trigger_async_embed_gated(monkeypatch):
+    """_trigger_async_embed feuert NUR bei recall_mode knn/hybrid (kein Embed wenn nie semantisch
+    gelesen wird) -- Daemon-Thread, fail-soft. Via Event robust getestet."""
+    from tools.vault import vault_wiring as vw
+    import threading, time
+    ev = threading.Event(); calls = []
+    def fake_reindex(t, o, **kw):
+        calls.append((t, o)); ev.set()
+        return {"status": "reindexed", "embedded": 1, "available": True}
+    monkeypatch.setattr(vw, "vault_reindex_owner", fake_reindex)
+    # OFF (tsvector): kein Thread, kein Embed
+    monkeypatch.setattr(vw, "vault_recall_mode", lambda: "tsvector")
+    vw._trigger_async_embed("t1", "o1"); time.sleep(0.15)
+    assert calls == []
+    # ON (hybrid): Thread feuert
+    monkeypatch.setattr(vw, "vault_recall_mode", lambda: "hybrid")
+    vw._trigger_async_embed("t1", "o1")
+    assert ev.wait(timeout=3) and ("t1", "o1") in calls

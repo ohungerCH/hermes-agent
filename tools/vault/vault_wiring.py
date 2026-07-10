@@ -69,12 +69,13 @@ def vault_recall_enabled() -> bool:
 
 def vault_recall_mode() -> str:
     """Server-seitiger Default-Recall-Mode (reversibler Flag, KEIN model-facing Param -> kein
-    Tool-Call-Site-Drift). 'tsvector' (Default) bis der Embed-Backfill gelaufen ist; danach auf 'knn'
-    (semantisch) flippbar. Unbekannter/fehlender Wert -> 'tsvector' (fail-safe)."""
+    Tool-Call-Site-Drift). 'tsvector' (Default, immer sicher) | 'knn' (rein semantisch, versteckt
+    neue un-embeddete Zeilen) | 'hybrid' (empfohlen sobald aktiv: tsvector-Boden + knn-Ranking, nichts
+    unsichtbar). Unbekannter/fehlender Wert -> 'tsvector' (fail-safe)."""
     try:
         from hermes_cli.config import load_config, cfg_get
         v = cfg_get(load_config(), "vault", "recall_mode", default="tsvector")
-        return v if v in ("tsvector", "knn") else "tsvector"
+        return v if v in ("tsvector", "knn", "hybrid") else "tsvector"
     except Exception:
         return "tsvector"
 
@@ -192,7 +193,13 @@ def vault_shadow_write(action: str, target: str, content: Optional[str],
         if ident is None:
             return None
         tenant_id, owner_id = ident
-        return _do_vault_op(action, target, content, old_entry, tenant_id, owner_id)
+        status = _do_vault_op(action, target, content, old_entry, tenant_id, owner_id)
+        # Write->async-Embed: nach einer confirmed geschriebenen Zeile den Vektor NACHZIEHEN, damit
+        # eine neue Notiz bald semantisch (knn/hybrid) suchbar ist -- fire-and-forget, KEINE
+        # Turn-Latenz, fail-soft. Nur bei status='written' (add/replace-confirmed; remove=invalidated).
+        if status == "written":
+            _trigger_async_embed(tenant_id, owner_id)
+        return status
     except Exception as e:  # noqa: BLE001 -- fail-soft: der Live-Turn darf NIE hierdran hängen
         logger.warning("vault shadow-write übersprungen (fail-soft): %s", type(e).__name__)
         return None
@@ -404,3 +411,25 @@ def vault_reindex_owner(tenant_id: str, owner_id: str, *, max_rows: int = 500) -
     except Exception as e:  # noqa: BLE001 -- fail-soft
         logger.warning("vault reindex übersprungen (fail-soft): %s", type(e).__name__)
         return {"status": "error", "embedded": 0, "available": False}
+
+
+def _trigger_async_embed(tenant_id: str, owner_id: str) -> None:
+    """Fire-and-forget Embed-Backfill nach einem confirmed Write, WENN semantischer Recall aktiv ist
+    (recall_mode knn/hybrid). Daemon-Thread -> KEINE Turn-Latenz; fail-soft (alle Fehler geschluckt).
+    reindex_owner ist idempotent (embedding IS NULL Guard) + owner-scoped -> concurrent Writes sicher;
+    er embettet die neue Zeile UND holt den etwaigen un-embeddeten Rückstand desselben Owners nach.
+    Ohne knn/hybrid: no-op (kein Vektor wird je gelesen -> kein Embed nötig, keine Zone-52-Last)."""
+    try:
+        if vault_recall_mode() not in ("knn", "hybrid"):
+            return
+
+        def _run():
+            try:
+                vault_reindex_owner(tenant_id, owner_id)
+            except Exception:  # noqa: BLE001 -- der Embed darf NIE etwas brechen
+                pass
+
+        import threading
+        threading.Thread(target=_run, daemon=True, name="vault-embed").start()
+    except Exception as e:  # noqa: BLE001 -- fail-soft: der Trigger darf den Write-Turn nie anfassen
+        logger.warning("vault async-embed nicht gestartet (fail-soft): %s", type(e).__name__)

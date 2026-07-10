@@ -587,15 +587,16 @@ class VaultStore:
                            memory_item_written=(affected > 0))
 
     def recall(self, req: MemoryRecall) -> RecallResult:
-        """Stufe-6 Lesepfad. Zwei Flächen über EINEN Anker + Runner: 'tsvector' (deutscher Volltext,
-        Default) und 'knn' (semantische Cosinus-Suche über den bge-m3-Vektor). Beide unter der
-        Composite-Anker-Policy (RLS-GUCs via vault_transaction) -- tenant/owner NIE im Query-Text.
-        Read-only, fail-soft, NIE raise. ``available`` unterscheidet 'sauber 0 Treffer' von 'nicht
-        nachschaubar' (Ehrlichkeits-Klausel); ``mode_used`` macht den KNN->tsvector-Fallback sichtbar.
+        """Stufe-6 Lesepfad. DREI Modi über die Composite-Anker-Policy (RLS-GUCs via vault_transaction,
+        tenant/owner NIE im Query-Text): 'tsvector' (deutscher Volltext), 'knn' (semantische Cosinus-
+        Suche über den bge-m3-Vektor) und 'hybrid' (tsvector-BODEN + knn-Ranking OBEN). Read-only,
+        fail-soft, NIE raise. ``available`` = 'sauber 0 Treffer' vs 'nicht nachschaubar' (Ehrlichkeit);
+        ``mode_used`` macht die Fläche + jeden Fallback beobachtbar.
 
-        KNN holt den Query-Vektor vom Embedding-Server (embed_client) VOR dem DB-Fenster (kein Netz
-        in der offenen Txn -> kein Hänger am Anker). Server weg / Antwort ungültig -> fail-soft
-        FALLBACK auf tsvector (mode_used='knn_fallback_tsvector'), statt leer/Fehler."""
+        HYBRID (empfohlener Default, sobald aktiv): der KNN-Filter `embedding IS NOT NULL` kann eine
+        noch nicht reindexte (neue) Zeile verstecken; tsvector als Boden fängt sie -> NIE unsichtbar,
+        embeddete Treffer bekommen trotzdem semantisches Ranking. Der Query-Vektor wird VOR dem
+        DB-Fenster geholt (kein Netz in der offenen Txn -> kein Hänger)."""
         # (0a) Anker fail-closed (wie write()/invalidate()): kein SELECT mit halbem Anker.
         try:
             tenant = normalize_context_value(req.tenant_id, "tenant_id")
@@ -604,38 +605,91 @@ class VaultStore:
             return RecallResult(status=STATUS_REFUSED, available=False, message=str(e))
 
         # (0b) Query fail-safe + Limit bounded. Leerer Suchbegriff -> sauberer 0-Treffer-Lauf.
+        mode = req.mode if req.mode in ("tsvector", "knn", "hybrid") else "tsvector"
         query = req.query.strip() if isinstance(req.query, str) else ""
         if not query:
-            return RecallResult(status=STATUS_RECALL_EMPTY, items=[], available=True, mode_used="tsvector")
+            return RecallResult(status=STATUS_RECALL_EMPTY, items=[], available=True, mode_used=mode)
         limit = req.limit if isinstance(req.limit, int) else RECALL_LIMIT_DEFAULT
         limit = max(1, min(limit, RECALL_LIMIT_MAX))
 
         # (0c) Fläche wählen. Default + unbekannter mode = tsvector (fail-safe).
-        if req.mode == "knn":
+        if mode == "hybrid":
+            return self._run_recall_hybrid(tenant, owner, query, limit)
+        if mode == "knn":
             sql, params, mode_used = self._knn_or_fallback(query, limit)
-        else:
-            sql, params, mode_used = _MEMORY_ITEMS_RECALL, (query, limit), "tsvector"
-        return self._run_recall(tenant, owner, sql, params, mode_used)
+            return self._run_recall(tenant, owner, sql, params, mode_used)
+        return self._run_recall(tenant, owner, _MEMORY_ITEMS_RECALL, (query, limit), "tsvector")
 
-    def _knn_or_fallback(self, query: str, limit: int):
-        """Holt den Query-Vektor vom Embedding-Server. Erfolg -> (KNN-SQL, params, 'knn'); Server
-        weg / ungültig / nicht-endlicher Vektor -> fail-soft (tsvector-SQL, params,
-        'knn_fallback_tsvector'). KNN darf den Recall NIE brechen."""
+    def _query_vector(self, query: str):
+        """Holt den Query-Vektor vom Embedding-Server (fail-soft). Rückgabe (version, vec_literal)
+        oder None (Server weg / ungültig / nicht-endlich). Der Vektor darf den Recall NIE brechen."""
         try:
             from tools.vault.embed_client import embed_texts, to_pgvector_literal
             emb = embed_texts([query])
             if emb is not None and emb.vectors:
-                vec_lit = to_pgvector_literal(emb.vectors[0])
-                return _MEMORY_ITEMS_RECALL_KNN, (emb.version, vec_lit, limit), "knn"
+                return emb.version, to_pgvector_literal(emb.vectors[0])
         except Exception as e:  # noqa: BLE001 -- fail-soft
-            logger.warning("vault recall: KNN-Query-Vektor fehlgeschlagen -> tsvector-Fallback: %s",
-                           type(e).__name__)
+            logger.warning("vault recall: Query-Vektor fehlgeschlagen: %s", type(e).__name__)
+        return None
+
+    def _knn_or_fallback(self, query: str, limit: int):
+        """Reiner KNN-Modus: Query-Vektor holen -> KNN-SQL; Server weg -> tsvector-Fallback (der
+        mode='knn' allein hat KEINEN Boden -> für neue Zeilen 'hybrid' nutzen)."""
+        qv = self._query_vector(query)
+        if qv is not None:
+            version, vec_lit = qv
+            return _MEMORY_ITEMS_RECALL_KNN, (version, vec_lit, limit), "knn"
         return _MEMORY_ITEMS_RECALL, (query, limit), "knn_fallback_tsvector"
+
+    def _run_recall_hybrid(self, tenant: str, owner: str, query: str, limit: int) -> RecallResult:
+        """Hybrid: KNN-Ranking OBEN (semantische Treffer zuerst) + tsvector-BODEN (fängt auch neue,
+        noch nicht embeddete Zeilen), union + dedup source_id, cap limit. Beide SELECTs in EINER
+        RLS-Txn. Query-Vektor VOR dem DB-Fenster. Server weg -> tsvector-only (mode_used=
+        'hybrid_tsvector_only'). NIE raise -> Fehler = RecallResult(status=error, available=False)."""
+        qv = self._query_vector(query)   # VOR dem DB-Fenster (kein Netz in der Txn)
+        conn = self._connect()
+        knn_rows, ts_rows = [], []
+        try:
+            with vault_transaction(conn, tenant, owner) as cur:
+                if qv is not None:
+                    version, vec_lit = qv
+                    cur.execute(_MEMORY_ITEMS_RECALL_KNN, (version, vec_lit, limit))
+                    knn_rows = cur.fetchall()
+                cur.execute(_MEMORY_ITEMS_RECALL, (query, limit))
+                ts_rows = cur.fetchall()
+        except BaseException as e:  # noqa: BLE001 -- fail-closed: kein stiller Teil-Read
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.error("vault recall failed (rolled back, mode=hybrid): %s", type(e).__name__)
+            return RecallResult(status=STATUS_ERROR, available=False, mode_used="hybrid",
+                                message="Vault-Recall nicht ausführbar -- kein Gedächtnis-Zugriff")
+
+        # Merge: knn zuerst (semantisches Ranking), dann tsvector-only (nicht schon in knn), dedup
+        # über den Natural-Key-Teil (source_table, source_id), cap limit.
+        merged = []
+        seen = set()
+        for r in list(knn_rows) + list(ts_rows):
+            key = (r[0], r[1])
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(r)
+            if len(merged) >= limit:
+                break
+        items, dropped = self._rows_to_items(merged)
+        if dropped:
+            logger.warning("vault recall: %d Zeile(n) mit unbekanntem source_table verworfen "
+                           "(Read-Whitelist, defense-in-depth)", dropped)
+        mode_used = "hybrid" if qv is not None else "hybrid_tsvector_only"
+        return RecallResult(
+            status=(STATUS_RECALLED if items else STATUS_RECALL_EMPTY),
+            items=items, available=True, mode_used=mode_used)
 
     def _run_recall(self, tenant: str, owner: str, sql: str, params: tuple, mode_used: str) -> RecallResult:
         """Führt EINE Recall-SQL unter der RLS-Anker-Policy aus (tsvector ODER KNN). Read-only: KEIN
-        commit (Pool rollbackt beim Checkin). Fetchall INNERHALB der Txn. Read-Whitelist am Rand
-        (defense-in-depth). Wirft NIE -- Fehler -> RecallResult(status=error, available=False)."""
+        commit (Pool rollbackt beim Checkin). Fetchall INNERHALB der Txn. Wirft NIE."""
         conn = self._connect()
         try:
             with vault_transaction(conn, tenant, owner) as cur:
@@ -649,10 +703,18 @@ class VaultStore:
             logger.error("vault recall failed (rolled back, mode=%s): %s", mode_used, type(e).__name__)
             return RecallResult(status=STATUS_ERROR, available=False, mode_used=mode_used,
                                 message="Vault-Recall nicht ausführbar -- kein Gedächtnis-Zugriff")
+        items, dropped = self._rows_to_items(rows)
+        if dropped:
+            logger.warning("vault recall: %d Zeile(n) mit unbekanntem source_table verworfen "
+                           "(Read-Whitelist, defense-in-depth)", dropped)
+        return RecallResult(
+            status=(STATUS_RECALLED if items else STATUS_RECALL_EMPTY),
+            items=items, available=True, mode_used=mode_used)
 
-        # Read-Whitelist (defense-in-depth): eine Zeile mit unerwartetem source_table wird NICHT ans
-        # Brain gereicht (fail-safe skip + Log) -- ein DB-Bug/Direkt-Insert kann so nie zu einem
-        # Rückgabe-Bug werden. Die verbleibenden Treffer bleiben nutzbar (kein Kill-des-ganzen-Recalls).
+    def _rows_to_items(self, rows):
+        """Read-Whitelist (defense-in-depth) + RecallItem-Bau. Eine Zeile mit unerwartetem
+        source_table wird NICHT ans Brain gereicht (fail-safe skip); ein DB-Bug/Direkt-Insert kann so
+        nie zu einem Rückgabe-Bug werden. Rückgabe (items, dropped)."""
         items = []
         dropped = 0
         for r in (rows or []):
@@ -663,12 +725,7 @@ class VaultStore:
                 source_table=r[0], source_id=r[1], summary=(r[2] or ""),
                 created_at=r[3], sensitivity=r[4], from_untrusted_inbound=bool(r[5]),
             ))
-        if dropped:
-            logger.warning("vault recall: %d Zeile(n) mit unbekanntem source_table verworfen "
-                           "(Read-Whitelist, defense-in-depth)", dropped)
-        return RecallResult(
-            status=(STATUS_RECALLED if items else STATUS_RECALL_EMPTY),
-            items=items, available=True, mode_used=mode_used)
+        return items, dropped
 
     # -- Validierung --------------------------------------------------------
     def _validate_vocab(self, req: MemoryWrite) -> str:
