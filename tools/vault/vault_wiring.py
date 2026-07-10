@@ -354,7 +354,7 @@ def vault_shadow_recall(query: str, target: str = "memory",
         if ident is None:
             return None
         tenant_id, owner_id = ident
-        use_mode = mode if mode in ("tsvector", "knn") else vault_recall_mode()
+        use_mode = mode if mode in ("tsvector", "knn", "hybrid") else vault_recall_mode()
         return _do_vault_recall(query, target, tenant_id, owner_id, limit, use_mode)
     except Exception as e:  # noqa: BLE001 -- fail-soft: der Live-Turn darf NIE hierdran hängen
         logger.warning("vault shadow-recall übersprungen (fail-soft): %s", type(e).__name__)
@@ -369,7 +369,7 @@ def _do_vault_recall(query: str, target: str, tenant_id: str, owner_id: str,
     from tools.vault.vault_store import VaultStore, MemoryRecall, RECALL_LIMIT_DEFAULT
     from tools.vault import db_runtime
     lim = limit if isinstance(limit, int) and limit > 0 else RECALL_LIMIT_DEFAULT
-    use_mode = mode if mode in ("tsvector", "knn") else "tsvector"
+    use_mode = mode if mode in ("tsvector", "knn", "hybrid") else "tsvector"
     pool = db_runtime.get_vault_pool()
     # getconn mit kurzem Timeout: ein toter Pool/DB darf den Live-Turn nicht hängen (fail-soft
     # deckt Blockieren, nicht nur Exceptions). Timeout -> Exception -> vom äusseren try gefangen.

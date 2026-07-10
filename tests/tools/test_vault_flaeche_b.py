@@ -334,3 +334,33 @@ def test_trigger_async_embed_gated(monkeypatch):
     monkeypatch.setattr(vw, "vault_recall_mode", lambda: "hybrid")
     vw._trigger_async_embed("t1", "o1")
     assert ev.wait(timeout=3) and ("t1", "o1") in calls
+
+
+def test_shadow_recall_hybrid_not_downgraded(monkeypatch):
+    """Regressions-Guard (Live-E2E-Befund 2026-07-11): _do_vault_recall/vault_shadow_recall dürfen
+    'hybrid' NICHT auf tsvector downgraden. Die Unit-Tests riefen store.recall DIREKT (umgingen die
+    Wiring-Mode-Validierung) -- nur der Live-Turn fing das fehlende 'hybrid' in der Allowlist."""
+    from tools.vault import vault_wiring as vw
+    from tools.vault import db_runtime
+    monkeypatch.setattr(vw, "vault_recall_enabled", lambda: True)
+    monkeypatch.setattr(vw, "vault_recall_mode", lambda: "hybrid")
+    monkeypatch.setattr(vw, "get_vault_write_identity", lambda: ("t1", "o1"))
+    import tools.write_approval as wa
+    monkeypatch.setattr(wa, "current_origin", lambda: "assistant_tool")
+    cap = {}
+    class _Store:
+        def __init__(self, connect): pass
+        def recall(self, req):
+            cap["mode"] = req.mode
+            from tools.vault.vault_store import RecallResult
+            return RecallResult(status="recall_empty", items=[], available=True, mode_used=req.mode)
+    class _Pool:
+        def getconn(self, timeout=None): return object()
+        def putconn(self, c): pass
+    monkeypatch.setattr("tools.vault.vault_store.VaultStore", _Store)
+    monkeypatch.setattr(db_runtime, "get_vault_pool", lambda: _Pool())
+    assert vw.vault_shadow_recall("kaffee").get("mode_used") == "hybrid"   # config-Default
+    assert cap["mode"] == "hybrid"
+    cap.clear()
+    assert vw.vault_shadow_recall("kaffee", mode="hybrid").get("mode_used") == "hybrid"  # explizit
+    assert cap["mode"] == "hybrid"
