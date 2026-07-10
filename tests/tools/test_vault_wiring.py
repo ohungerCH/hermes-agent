@@ -465,3 +465,21 @@ def test_memory_tool_hook_pops_vault_old_entry(monkeypatch):
     assert "_vault_old_entry" not in body          # dem Modell NIE gezeigt
     assert seen["old_entry"] == "Alter Eintrag"    # aber an den Shadow-Write gereicht
     assert seen["result_has_key"] is False         # schon vor dem Hook-Call gepoppt
+
+
+# ---------------------------------------------------------------------------
+# DLP-Redaktion owner_memory (Owner-Ratifikation 2026-07-11)
+# ---------------------------------------------------------------------------
+
+def test_build_request_owner_memory_is_embed_eligible():
+    """Owner-ratifizierter Guard: owner_memory ist owner-authored Klartext -> redaction_state MUSS
+    'applied' sein (nichts zu redigieren), sonst wird die Zeile NIE embed-fähig (embed-gate) und die
+    semantische Suche bleibt tot. Dreht ein Refactor das still auf 'pending', bricht dieser Test.
+    sanitization_state bleibt Store-Sache (Injektions-Scan) -> hier nicht geprüft."""
+    req = vw._build_request("memory", "Owner-Notiz", "t1", "o1")
+    assert req.redaction_state == "applied", "owner_memory muss redaktions-fertig sein (embed-eligible)"
+    assert req.taint == {"from_untrusted_inbound": False}
+    from tools.vault.vault_store import SOURCE_FOREGROUND_OWNER
+    assert req.source == SOURCE_FOREGROUND_OWNER
+    # user_profile (target='user') ist ebenfalls owner-authored -> gleiche Regel.
+    assert vw._build_request("user", "Profil", "t1", "o1").redaction_state == "applied"

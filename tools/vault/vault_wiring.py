@@ -189,8 +189,18 @@ def vault_shadow_write(action: str, target: str, content: Optional[str],
 def _build_request(target: str, content: str, tenant_id: str, owner_id: str):
     """Baut den MemoryWrite. PHASE-1-Defaults (WIRING_PLAN §5): sensitivity personal_low,
     trust_level trusted (Owner-authored), summary_redacted=content (keine DLP-Pipeline ->
-    trivial scan⊇recall, WIRING_PLAN §5a-Invariante erfüllt), redaction pending -> embedding
-    bleibt NULL bis ein späterer Redaktions-/Embed-Lauf."""
+    trivial scan⊇recall, WIRING_PLAN §5a-Invariante erfüllt).
+
+    redaction_state='applied' (Owner-Ratifikation 2026-07-11): owner_memory ist owner-authored
+    Klartext (from_untrusted_inbound=False, trusted) -> es gibt NICHTS zu redigieren; der Owner hat
+    bewusst freigegeben (ADR-0041:252 "Fulltext nur aus redigierten ODER bewusst freigegebenen
+    Inhalten"). Die echte PII-Redaktions-Pipeline bleibt für SPÄTERE untrusted-inbound Quellen
+    (M365/Mail/SMS/Web) reserviert. sanitization_state (Injektions-Scan) bleibt UNBERÜHRT scharf
+    (der Store setzt es aus scanner_ok). Wirkung des Flips: (a) die Zeile wird embed-FÄHIG
+    (embed-gate redaction+sanitization applied) -> ein späterer owner-scoped Reindex-Lauf füllt den
+    Vektor; (b) ein same-hash-Re-Write hält jetzt confirmed + den Vektor (keep-cond wahr) statt auf
+    candidate zu degradieren (der zuvor deferrte Phase-1-pending-Effekt, WIRING_PLAN §5b, jetzt
+    aufgelöst). Ändert NICHT den tsvector-Recall (der filtert sanitization, nicht redaction)."""
     from tools.vault.vault_store import (
         MemoryWrite, SOURCE_FOREGROUND_OWNER, TRUST_TRUSTED, RETENTION_PERMANENT_MEANING,
     )
@@ -201,7 +211,7 @@ def _build_request(target: str, content: str, tenant_id: str, owner_id: str):
         source_id=_phase1_source_id(content), source_hash=_phase1_source_id(content),
         sensitivity="personal_low", trust_level=TRUST_TRUSTED,
         retention_class=RETENTION_PERMANENT_MEANING,
-        summary_redacted=content, redaction_state="pending", redaction_version="v0",
+        summary_redacted=content, redaction_state="applied", redaction_version="owner-noop-v1",
         taint={"from_untrusted_inbound": False},
     )
 
