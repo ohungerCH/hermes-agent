@@ -34,6 +34,13 @@ from typing import Any, Dict, Iterator, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Foreground-Owner-Origins (skill_provenance-Taxonomie): der dark-wire feuert NUR für diese --
+# "foreground" (roher ContextVar-Default) ODER "assistant_tool" (der Normalfall: das Modell ruft
+# im OWNER-Turn das memory-Werkzeug). "background_review" (Hintergrund-Selbstverbesserungs-Fork)
+# ist bewusst AUSGESCHLOSSEN (§5-Background-Promote-Hazard: fehl-gestempelte owner_id passiert RLS).
+# Fail-closed: eine unbekannte Herkunft -> kein Vault-Write.
+_FOREGROUND_ORIGINS = frozenset({"foreground", "assistant_tool"})
+
 
 # ---------------------------------------------------------------------------
 # Flag-Leiter (INV-6)
@@ -165,7 +172,7 @@ def vault_shadow_write(action: str, target: str, content: Optional[str],
             return None
         try:
             from tools.write_approval import current_origin
-            if current_origin() != "foreground":
+            if current_origin() not in _FOREGROUND_ORIGINS:
                 return None
         except Exception:
             return None  # Herkunft unklar -> fail-closed kein Vault-Write

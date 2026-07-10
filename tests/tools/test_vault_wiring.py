@@ -238,6 +238,19 @@ def test_write_mode_calls_vaultstore_with_correct_request(monkeypatch):
     assert req.source_id == req.source_hash and len(req.source_id) == 64
 
 
+def test_fires_for_assistant_tool_origin(monkeypatch):
+    # assistant_tool = das Modell ruft im Owner-Turn das memory-Werkzeug (Normalfall) -> MUSS als
+    # Foreground-Owner-Origin feuern (Live-Befund 2026-07-10; current_origin() ist im echten Turn
+    # 'assistant_tool', nicht 'foreground').
+    _flags(monkeypatch, write=True)
+    _foreground(monkeypatch, origin="assistant_tool")
+    _patch_write_backend(monkeypatch)
+    with vw.vault_write_identity("t", "o"):
+        out = vw.vault_shadow_write("add", "memory", "Notiz", store_result=OK)
+    assert out == "written"
+    assert FakeStore.last_req is not None
+
+
 def test_write_mode_user_target_maps_to_user_profile(monkeypatch):
     _flags(monkeypatch, write=True)
     _foreground(monkeypatch)
