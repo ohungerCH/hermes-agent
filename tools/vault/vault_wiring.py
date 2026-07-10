@@ -67,6 +67,18 @@ def vault_recall_enabled() -> bool:
     return _vault_flag("recall_enabled")
 
 
+def vault_recall_mode() -> str:
+    """Server-seitiger Default-Recall-Mode (reversibler Flag, KEIN model-facing Param -> kein
+    Tool-Call-Site-Drift). 'tsvector' (Default) bis der Embed-Backfill gelaufen ist; danach auf 'knn'
+    (semantisch) flippbar. Unbekannter/fehlender Wert -> 'tsvector' (fail-safe)."""
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        v = cfg_get(load_config(), "vault", "recall_mode", default="tsvector")
+        return v if v in ("tsvector", "knn") else "tsvector"
+    except Exception:
+        return "tsvector"
+
+
 def vault_path_active() -> bool:
     """Läuft der dark-wire überhaupt? (plumbing ODER write). write impliziert plumbing."""
     return vault_plumbing_enabled() or vault_write_enabled()
@@ -313,13 +325,13 @@ def _wrap_recalled(summary: str, source_table: str, untrusted: bool) -> str:
 
 
 def vault_shadow_recall(query: str, target: str = "memory",
-                        *, limit: Optional[int] = None) -> Optional[Dict[str, Any]]:
-    """Best-effort Vault-Recall (tsvector-Fläche). Rückgabe = ein Modell-sicheres Dict oder None.
-    NIE raise. No-op (None) wenn: recall_enabled aus / leerer Query / origin!=foreground / keine
-    Session-Identität. Bei aktiver Naht + Fehler/toter DB: {available: False, ...} (fail-soft) --
-    NIE als "kein Gedächtnis": eine leere Trefferliste bei available=True heisst "nichts gemerkt
-    zu X"; available=False heisst "konnte nicht nachsehen". Jeder Treffer ist als untrusted DATEN
-    gewrappt (s. _wrap_recalled)."""
+                        *, limit: Optional[int] = None, mode: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Best-effort Vault-Recall. Rückgabe = ein Modell-sicheres Dict oder None. NIE raise. No-op
+    (None) wenn: recall_enabled aus / leerer Query / origin!=foreground / keine Session-Identität.
+    Bei aktiver Naht + Fehler/toter DB: {available: False, ...} (fail-soft) -- NIE als "kein
+    Gedächtnis". Jeder Treffer ist als untrusted DATEN gewrappt (s. _wrap_recalled). ``mode``:
+    'tsvector' (Volltext) oder 'knn' (semantisch; fällt server-tot auf tsvector zurück, das Ergebnis
+    trägt `mode_used`)."""
     try:
         if not vault_recall_enabled():
             return None
@@ -335,19 +347,22 @@ def vault_shadow_recall(query: str, target: str = "memory",
         if ident is None:
             return None
         tenant_id, owner_id = ident
-        return _do_vault_recall(query, target, tenant_id, owner_id, limit)
+        use_mode = mode if mode in ("tsvector", "knn") else vault_recall_mode()
+        return _do_vault_recall(query, target, tenant_id, owner_id, limit, use_mode)
     except Exception as e:  # noqa: BLE001 -- fail-soft: der Live-Turn darf NIE hierdran hängen
         logger.warning("vault shadow-recall übersprungen (fail-soft): %s", type(e).__name__)
         return None
 
 
 def _do_vault_recall(query: str, target: str, tenant_id: str, owner_id: str,
-                     limit: Optional[int]) -> Dict[str, Any]:
+                     limit: Optional[int], mode: str = "tsvector") -> Dict[str, Any]:
     """Führt den Recall aus: borrow conn -> VaultStore.recall -> return conn. Wrappt jeden Treffer
-    als untrusted Daten. ``available`` spiegelt RecallResult.available (Ehrlichkeits-Klausel)."""
+    als untrusted Daten. ``available`` spiegelt RecallResult.available (Ehrlichkeits-Klausel);
+    ``mode_used`` macht den KNN->tsvector-Fallback sichtbar."""
     from tools.vault.vault_store import VaultStore, MemoryRecall, RECALL_LIMIT_DEFAULT
     from tools.vault import db_runtime
     lim = limit if isinstance(limit, int) and limit > 0 else RECALL_LIMIT_DEFAULT
+    use_mode = mode if mode in ("tsvector", "knn") else "tsvector"
     pool = db_runtime.get_vault_pool()
     # getconn mit kurzem Timeout: ein toter Pool/DB darf den Live-Turn nicht hängen (fail-soft
     # deckt Blockieren, nicht nur Exceptions). Timeout -> Exception -> vom äusseren try gefangen.
@@ -355,11 +370,11 @@ def _do_vault_recall(query: str, target: str, tenant_id: str, owner_id: str,
     try:
         store = VaultStore(connect=lambda: conn)
         res = store.recall(MemoryRecall(
-            owner_id=owner_id, tenant_id=tenant_id, query=query, limit=lim))
+            owner_id=owner_id, tenant_id=tenant_id, query=query, limit=lim, mode=use_mode))
     finally:
         pool.putconn(conn)  # reset_on_return='rollback' säubert die Read-Txn + transaction-local GUCs
     if not res.available:
-        return {"available": False, "matches": [], "reason": res.status}
+        return {"available": False, "matches": [], "reason": res.status, "mode_used": res.mode_used}
     matches = [
         {
             "source": it.source_table,
@@ -367,4 +382,25 @@ def _do_vault_recall(query: str, target: str, tenant_id: str, owner_id: str,
         }
         for it in res.items
     ]
-    return {"available": True, "matches": matches, "count": len(matches)}
+    return {"available": True, "matches": matches, "count": len(matches), "mode_used": res.mode_used}
+
+
+def vault_reindex_owner(tenant_id: str, owner_id: str, *, max_rows: int = 500) -> Dict[str, Any]:
+    """Einmaliger owner-scoped Embed-Backfill (Fläche-B Phase 3, KEIN Cron): füllt die embedding-
+    Vektoren embed-fähiger confirmed Zeilen für EINEN (tenant, owner) über den bge-m3-Server. Admin-
+    Trigger (bewachter Lauf), NICHT im Live-Turn. Fail-soft -> Dict (nie raise). Der Aufrufer liefert
+    die aufgelöste Owner-Identität (owner-primary); KEIN Cross-Owner-Batch (RLS-Doktrin)."""
+    try:
+        from tools.vault.reindex import reindex_owner
+        from tools.vault import db_runtime
+        pool = db_runtime.get_vault_pool()
+        conn = pool.getconn(timeout=max(db_runtime.VAULT_GETCONN_TIMEOUT_S, 5.0))
+        try:
+            res = reindex_owner(tenant_id, owner_id, connect=lambda: conn, max_rows=max_rows)
+        finally:
+            pool.putconn(conn)
+        return {"status": res.status, "embedded": res.embedded, "scanned": res.scanned,
+                "available": res.available}
+    except Exception as e:  # noqa: BLE001 -- fail-soft
+        logger.warning("vault reindex übersprungen (fail-soft): %s", type(e).__name__)
+        return {"status": "error", "embedded": 0, "available": False}

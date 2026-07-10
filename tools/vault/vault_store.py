@@ -230,11 +230,14 @@ class MemoryRecall:
     """Eine Recall-/Lese-Anfrage (Stufe 6, tsvector-Fläche). Trägt KEINEN neuen Content -- sie liest
     nur owner-eigene, confirmed Zeilen (RLS + WHERE-Kontrakt). ``tenant_id``/``owner_id`` kommen
     server-autoritativ vom Aufrufer (ContextVar-Identität, NIE client-geliefert). ``query`` ist der
-    Volltext-Suchbegriff (websearch_to_tsquery, deutsch)."""
+    Volltext-/Semantik-Suchbegriff. ``mode``: 'tsvector' (Default, deutscher Volltext) oder 'knn'
+    (semantische Cosinus-Suche über den bge-m3-Vektor; der Read holt den Query-Vektor vom Embedding-
+    Server und fällt fail-soft auf tsvector zurück, wenn der Server nicht erreichbar ist)."""
     owner_id: str
     tenant_id: str
     query: str
     limit: int = RECALL_LIMIT_DEFAULT
+    mode: str = "tsvector"
 
 
 @dataclass
@@ -254,11 +257,14 @@ class RecallItem:
 class RecallResult:
     """Ergebnis eines recall()-Versuchs. ``available`` ist load-bearing für die Ehrlichkeits-Klausel:
     True = der Lesepfad lief (auch bei 0 Treffern -> begründete Abwesenheit); False = Fehler / nicht
-    erreichbar (KEIN Rückschluss auf An-/Abwesenheit möglich)."""
+    erreichbar (KEIN Rückschluss auf An-/Abwesenheit möglich). ``mode_used`` macht den fail-soft-
+    Fallback BEOBACHTBAR (Ehrlichkeit): 'tsvector' | 'knn' | 'knn_fallback_tsvector' (KNN angefragt,
+    aber Embedding-Server weg -> auf Volltext zurückgefallen)."""
     status: str
     items: list = field(default_factory=list)
     available: bool = False
     message: str = ""
+    mode_used: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +396,27 @@ _MEMORY_ITEMS_RECALL = (
     "AND sanitization_state = 'applied' "
     "AND to_tsvector('german', coalesce(summary_redacted, '')) @@ q "
     "ORDER BY ts_rank(to_tsvector('german', coalesce(summary_redacted, '')), q) DESC, created_at DESC "
+    "LIMIT %s"
+)
+
+# Recall Fläche B (semantische exakt-KNN Cosinus). GLEICHER WHERE-Kontrakt wie tsvector (confirmed +
+# nicht gelöscht/quarantänet/abgelöst + sanitization applied) PLUS: `embedding_version = %s` (KNN darf
+# NUR gleiche Version vergleichen -- ein Modell-/Version-Wechsel mischt keine Vektor-Generationen,
+# ADR-0042 §C) UND `embedding IS NOT NULL` (nur reindexte Zeilen). Ranking = `embedding <=> %s::vector`
+# (Cosinus-Distanz, vector_cosine_ops; die Vektoren sind normalize_embeddings=True). KEIN ANN-Index
+# (exakt-KNN Seq-Scan) -> RLS bleibt ECHTER Pre-Filter (GAP-B): pg berechnet die Distanz je Zeile UND
+# wendet WHERE/RLS WÄHREND des Scans an; ein HNSW/IVFFlat machte RLS zum POST-Filter (Under-Return +
+# Timing-Seitenkanal). tenant/owner NIE im Query-Text -- die Composite-Anker-Policy trägt sie.
+# Params: (embedding_version, query_vektor_literal, limit).
+_MEMORY_ITEMS_RECALL_KNN = (
+    "SELECT source_table, source_id, summary_redacted, created_at, sensitivity, from_untrusted_inbound "
+    "FROM public.memory_items "
+    "WHERE lifecycle_status = 'confirmed' "
+    "AND deleted_at IS NULL AND quarantined_at IS NULL AND superseded_at IS NULL "
+    "AND sanitization_state = 'applied' "
+    "AND embedding_version = %s "
+    "AND embedding IS NOT NULL "
+    "ORDER BY embedding <=> %s::vector "
     "LIMIT %s"
 )
 
@@ -560,13 +587,15 @@ class VaultStore:
                            memory_item_written=(affected > 0))
 
     def recall(self, req: MemoryRecall) -> RecallResult:
-        """Stufe-6 Lesepfad (tsvector-Fläche). SELECT über den vollständigen Recall-Filter unter der
+        """Stufe-6 Lesepfad. Zwei Flächen über EINEN Anker + Runner: 'tsvector' (deutscher Volltext,
+        Default) und 'knn' (semantische Cosinus-Suche über den bge-m3-Vektor). Beide unter der
         Composite-Anker-Policy (RLS-GUCs via vault_transaction) -- tenant/owner NIE im Query-Text.
-        Read-only: KEIN commit (der Pool rollbackt den Read-Scope beim Checkin). Fetchall INNERHALB
-        des Transaktions-Fensters (reset-on-return leert die Connection danach). Wirft NIE -- ein
-        Fehler kommt als RecallResult(status=error, available=False) zurück (die Naht ist zusätzlich
-        fail-soft). ``available`` unterscheidet 'sauber 0 Treffer' (True) von 'nicht nachschaubar'
-        (False) -- die Ehrlichkeits-Klausel darf leeren Recall NIE als bewiesene Abwesenheit lesen."""
+        Read-only, fail-soft, NIE raise. ``available`` unterscheidet 'sauber 0 Treffer' von 'nicht
+        nachschaubar' (Ehrlichkeits-Klausel); ``mode_used`` macht den KNN->tsvector-Fallback sichtbar.
+
+        KNN holt den Query-Vektor vom Embedding-Server (embed_client) VOR dem DB-Fenster (kein Netz
+        in der offenen Txn -> kein Hänger am Anker). Server weg / Antwort ungültig -> fail-soft
+        FALLBACK auf tsvector (mode_used='knn_fallback_tsvector'), statt leer/Fehler."""
         # (0a) Anker fail-closed (wie write()/invalidate()): kein SELECT mit halbem Anker.
         try:
             tenant = normalize_context_value(req.tenant_id, "tenant_id")
@@ -574,26 +603,51 @@ class VaultStore:
         except VaultContextError as e:
             return RecallResult(status=STATUS_REFUSED, available=False, message=str(e))
 
-        # (0b) Query fail-safe + Limit bounded. Leerer Suchbegriff -> sauberer 0-Treffer-Lauf
-        #      (available=True: der Pfad ist erreichbar, es gibt nur nichts zu matchen), KEIN Fehler.
+        # (0b) Query fail-safe + Limit bounded. Leerer Suchbegriff -> sauberer 0-Treffer-Lauf.
         query = req.query.strip() if isinstance(req.query, str) else ""
         if not query:
-            return RecallResult(status=STATUS_RECALL_EMPTY, items=[], available=True)
+            return RecallResult(status=STATUS_RECALL_EMPTY, items=[], available=True, mode_used="tsvector")
         limit = req.limit if isinstance(req.limit, int) else RECALL_LIMIT_DEFAULT
         limit = max(1, min(limit, RECALL_LIMIT_MAX))
 
+        # (0c) Fläche wählen. Default + unbekannter mode = tsvector (fail-safe).
+        if req.mode == "knn":
+            sql, params, mode_used = self._knn_or_fallback(query, limit)
+        else:
+            sql, params, mode_used = _MEMORY_ITEMS_RECALL, (query, limit), "tsvector"
+        return self._run_recall(tenant, owner, sql, params, mode_used)
+
+    def _knn_or_fallback(self, query: str, limit: int):
+        """Holt den Query-Vektor vom Embedding-Server. Erfolg -> (KNN-SQL, params, 'knn'); Server
+        weg / ungültig / nicht-endlicher Vektor -> fail-soft (tsvector-SQL, params,
+        'knn_fallback_tsvector'). KNN darf den Recall NIE brechen."""
+        try:
+            from tools.vault.embed_client import embed_texts, to_pgvector_literal
+            emb = embed_texts([query])
+            if emb is not None and emb.vectors:
+                vec_lit = to_pgvector_literal(emb.vectors[0])
+                return _MEMORY_ITEMS_RECALL_KNN, (emb.version, vec_lit, limit), "knn"
+        except Exception as e:  # noqa: BLE001 -- fail-soft
+            logger.warning("vault recall: KNN-Query-Vektor fehlgeschlagen -> tsvector-Fallback: %s",
+                           type(e).__name__)
+        return _MEMORY_ITEMS_RECALL, (query, limit), "knn_fallback_tsvector"
+
+    def _run_recall(self, tenant: str, owner: str, sql: str, params: tuple, mode_used: str) -> RecallResult:
+        """Führt EINE Recall-SQL unter der RLS-Anker-Policy aus (tsvector ODER KNN). Read-only: KEIN
+        commit (Pool rollbackt beim Checkin). Fetchall INNERHALB der Txn. Read-Whitelist am Rand
+        (defense-in-depth). Wirft NIE -- Fehler -> RecallResult(status=error, available=False)."""
         conn = self._connect()
         try:
             with vault_transaction(conn, tenant, owner) as cur:
-                cur.execute(_MEMORY_ITEMS_RECALL, (query, limit))
+                cur.execute(sql, params)
                 rows = cur.fetchall()   # INNERHALB der Txn materialisieren (reset-on-return leert danach)
         except BaseException as e:  # noqa: BLE001 -- fail-closed: kein stiller Teil-Read
             try:
                 conn.rollback()
             except Exception:
                 pass
-            logger.error("vault recall failed (rolled back): %s", type(e).__name__)
-            return RecallResult(status=STATUS_ERROR, available=False,
+            logger.error("vault recall failed (rolled back, mode=%s): %s", mode_used, type(e).__name__)
+            return RecallResult(status=STATUS_ERROR, available=False, mode_used=mode_used,
                                 message="Vault-Recall nicht ausführbar -- kein Gedächtnis-Zugriff")
 
         # Read-Whitelist (defense-in-depth): eine Zeile mit unerwartetem source_table wird NICHT ans
@@ -614,7 +668,7 @@ class VaultStore:
                            "(Read-Whitelist, defense-in-depth)", dropped)
         return RecallResult(
             status=(STATUS_RECALLED if items else STATUS_RECALL_EMPTY),
-            items=items, available=True)
+            items=items, available=True, mode_used=mode_used)
 
     # -- Validierung --------------------------------------------------------
     def _validate_vocab(self, req: MemoryWrite) -> str:
