@@ -50,15 +50,21 @@ def test_setgid_block_present(stage2_text: str) -> None:
 
 
 def test_setgid_block_runs_after_chown_cron(stage2_text: str) -> None:
-    """The setgid block MUST come AFTER the unconditional `chown -R … cron` block, else
-    the recursive chown clobbers the group/setgid bit on every boot."""
-    chown_idx = stage2_text.find('chown -R hermes:hermes "$HERMES_HOME/cron"')
+    """The setgid block MUST come AFTER the unconditional cron-chown block, else the
+    recursive chown clobbers the group/setgid bit on every boot.
+
+    Migration 0.16->0.18.2: upstream refaktorierte den rohen ``chown -R hermes:hermes``
+    in die symlink-sichere Wrapper-Funktion ``chown_hermes_tree`` (macht intern weiterhin
+    ``chown -R``). Die Boot-Invariante (cron-chown VOR dem setgid-Block) ist identisch --
+    nur das gesuchte Muster ist jetzt der Wrapper-Call.
+    """
+    chown_idx = stage2_text.find('chown_hermes_tree "$HERMES_HOME/cron"')
     setgid_idx = stage2_text.find("Research-Enqueue cross-UID handoff")
-    assert chown_idx != -1, "the `chown -R … cron` block must exist"
+    assert chown_idx != -1, "the `chown_hermes_tree … cron` block must exist"
     assert setgid_idx != -1, "the setgid block must exist"
     assert setgid_idx > chown_idx, (
-        "the research-enqueue setgid block must run AFTER the `chown -R … cron` block "
-        "(otherwise the recursive chown clobbers the shared group + setgid bit)"
+        "the research-enqueue setgid block must run AFTER the `chown_hermes_tree … cron` "
+        "block (otherwise the recursive chown clobbers the shared group + setgid bit)"
     )
 
 

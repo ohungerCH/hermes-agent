@@ -143,8 +143,12 @@ def _isolate_home(tmp_path, monkeypatch):
 
 def test_module_under_worktree():
     p = rw.__file__
-    assert "-worktree" in p and "/runtime/hermes-agent/tools/" not in p, (
-        f"research_enqueue_worker resolved to {p!r}; tests must exercise the worktree copy."
+    # Der Engine-Checkout wurde 2026-06-28 auf ``runtime/hermes-main`` umbenannt
+    # (CLAUDE.md; die alte Naht ``.phase2-worktree`` ist historisch). Akzeptiere den
+    # kanonischen Source-Checkout ODER die alte ``-worktree``-Naht, aber NIE die
+    # Deploy-Kopie unter ``/runtime/hermes-agent/tools/``.
+    assert ("/runtime/hermes-main/" in p or "-worktree" in p) and "/runtime/hermes-agent/tools/" not in p, (
+        f"research_enqueue_worker resolved to {p!r}; tests must exercise the source checkout copy."
     )
 
 
@@ -235,7 +239,31 @@ class TestLaneSeparationInvariant:
 #           reaching the provider raw.
 # ---------------------------------------------------------------------------
 
+# NOTE (merge triage 2026-07-11): every test in TestReasoningEffortPin that
+# asserts the worker FORWARDS reasoning_effort to cronjob() is quarantined.
+# These tests are NOT a merge regression — the worker file is byte-identical to
+# the pre-merge fork HEAD. The forwarding they assert was DELIBERATELY disabled
+# in commit e57d51502 ("reasoning_effort temporaer NICHT an cronjob uebergeben")
+# because a long silent Codex "think" phase tripped the 12s-no-events reconnect
+# watchdog into a broken-pipe hang. norm["reasoning_effort"] stays computed and
+# clamped (dormant-wired) in _fire_research_job; re-enabling forwarding is an
+# explicit deferred #60 follow-up gated on the watchdog fix. Do NOT "restore"
+# forwarding to make these green — that reintroduces the known hang.
+# The lane-hold / capability-pin invariants these tests also touched are FULLY
+# covered by the passing TestLaneSeparationInvariant (web-only, model, provider,
+# profile-not-passed). The clamp itself stays covered by the live
+# test_normalise_sets_reasoning_effort below (pure _normalise_enqueue, no cronjob).
+_EFFORT_FORWARD_DEFERRED = (
+    "reasoning_effort forwarding deliberately disabled in worker "
+    "(commit e57d51502, Codex-stream-stall/watchdog hang); re-enable is a "
+    "deferred #60 follow-up gated on the reconnect-watchdog fix. Not a merge "
+    "regression (worker byte-identical to fork HEAD). Lane-hold covered by "
+    "TestLaneSeparationInvariant."
+)
+
+
 class TestReasoningEffortPin:
+    @pytest.mark.skip(reason=_EFFORT_FORWARD_DEFERRED)
     def test_passthrough_explicit_effort(self, _isolate_home):
         """An explicit, valid reasoning_effort reaches cronjob() unchanged."""
         p = _write_enqueue(_isolate_home, _enqueue(reasoning_effort="xhigh"))
@@ -243,6 +271,7 @@ class TestReasoningEffortPin:
             process_one(p)
         assert m.call_args.kwargs["reasoning_effort"] == "xhigh"
 
+    @pytest.mark.skip(reason=_EFFORT_FORWARD_DEFERRED)
     @pytest.mark.parametrize("effort", ["minimal", "low", "medium", "high", "xhigh"])
     def test_all_valid_levels_pass_through(self, _isolate_home, effort):
         p = _write_enqueue(_isolate_home, _enqueue(reasoning_effort=effort),
@@ -251,6 +280,7 @@ class TestReasoningEffortPin:
             process_one(p)
         assert m.call_args.kwargs["reasoning_effort"] == effort
 
+    @pytest.mark.skip(reason=_EFFORT_FORWARD_DEFERRED)
     def test_default_is_high_when_absent(self, _isolate_home):
         """A file omitting reasoning_effort -> the default ``high`` is forwarded."""
         payload = _enqueue()
@@ -262,6 +292,7 @@ class TestReasoningEffortPin:
         assert m.call_args.kwargs["reasoning_effort"] == "high"
         assert _DEFAULT_REASONING_EFFORT == "high"
 
+    @pytest.mark.skip(reason=_EFFORT_FORWARD_DEFERRED)
     @pytest.mark.parametrize("junk", [
         "rm -rf /", "EXTREME", "ultra", "", "  ", 99, True, None,
         ["high"], {"effort": "high"},
@@ -275,12 +306,14 @@ class TestReasoningEffortPin:
             process_one(p)
         assert m.call_args.kwargs["reasoning_effort"] == "high"
 
+    @pytest.mark.skip(reason=_EFFORT_FORWARD_DEFERRED)
     def test_effort_value_is_case_insensitive(self, _isolate_home):
         p = _write_enqueue(_isolate_home, _enqueue(reasoning_effort="XHigh"))
         with patch.object(rw, "cronjob", return_value=_ok_cron_return()) as m:
             process_one(p)
         assert m.call_args.kwargs["reasoning_effort"] == "xhigh"
 
+    @pytest.mark.skip(reason=_EFFORT_FORWARD_DEFERRED)
     def test_honoring_effort_never_widens_the_lane(self, _isolate_home):
         """ADVERSARIAL: a file that tampers with the capability pins AND requests a
         junk reasoning_effort must STILL fire web-only with the Codex pins, and the
@@ -358,11 +391,17 @@ class TestRealCronContract:
         assert job["model"] == "gpt-5.4"
         assert job["provider"] == "openai-codex"
         assert job["repeat"]["times"] == 1
-        # #60: reasoning_effort survives the REAL cronjob()->create_job() signature
-        # and lands on the stored job (kills the false-green where a mock would
-        # accept a kwarg the real signature silently drops). Lane-neutral — the
-        # web-only / model / provider pins above are unaffected.
-        assert job["reasoning_effort"] == "xhigh"
+        # #60: reasoning_effort forwarding is DEFERRED at the worker (commit
+        # e57d51502, Codex-stream-stall). The worker no longer passes
+        # reasoning_effort to cronjob(), so the stored job carries the
+        # provider-default (None) — NOT because the merge dropped a seam
+        # (worker byte-identical to fork HEAD; create_job STILL stores the field
+        # when given, verified independently). The load-bearing REAL-contract
+        # assertions this test exists for — web-only / model / provider / repeat
+        # pins surviving cronjob()->create_job() persistence — are checked above
+        # and remain green. Re-tighten to == "xhigh" when worker forwarding is
+        # re-enabled post-watchdog-fix (deferred #60 follow-up).
+        assert job.get("reasoning_effort") is None
         # profile is NOT carried on the deploy line (unsupported signature) ->
         # the stored job has no profile key. This pins the honest limitation.
         assert "profile" not in job
@@ -495,7 +534,15 @@ class TestQuarantine:
             res = process_one(p)
         assert res == "job-xyz"
         m.assert_called_once()
-        assert m.call_args.kwargs["reasoning_effort"] == "low"
+        # NOTE (merge triage 2026-07-11): the reasoning_effort forwarding assertion
+        # (was: kwargs["reasoning_effort"] == "low") is dropped — worker forwarding
+        # is deliberately disabled (commit e57d51502, Codex-stream-stall) and is a
+        # deferred #60 follow-up, NOT a merge regression. This test's load-bearing
+        # coverage is the v2-schema ACCEPTANCE (additive v1 + reasoning_effort
+        # sibling): the worker MUST accept research.enqueue.v2, fire, and NOT
+        # quarantine it — asserted below. Re-add the forwarding assert when worker
+        # forwarding is re-enabled post-watchdog-fix.
+        assert "reasoning_effort" not in m.call_args.kwargs
         # Fired + marked done; NOT quarantined.
         assert (p.parent / (p.name + ".processing.done")).exists()
         assert not (p.parent / (p.name + ".processing.failed")).exists()

@@ -129,6 +129,10 @@ class TestTickerLoopWiring:
              patch("gateway.platforms.base.cleanup_document_cache", return_value=0), \
              patch("hermes_cli.debug._sweep_expired_pastes", return_value=(0, 0)):
             # interval=0 so the post-iteration stop_event.wait returns immediately.
-            gw._start_cron_ticker(stop_event, adapters=None, loop=None, interval=0)
+            # Migration 0.16->0.18.2: der Research-Scan wanderte aus dem (jetzt deprecated)
+            # _start_cron_ticker-Shim in _start_gateway_housekeeping (Upstream splittete den
+            # Cron-Trigger von den Gateway-Chores). Laufzeit-Thread-Target ist ebenfalls
+            # _start_gateway_housekeeping (gateway/run.py) -> der Scan wird real invoked.
+            gw._start_gateway_housekeeping(stop_event, adapters=None, loop=None, interval=0)
 
-        assert seen["scan"] == 1, "research enqueue scan was not invoked by the ticker loop"
+        assert seen["scan"] == 1, "research enqueue scan was not invoked by the housekeeping loop"

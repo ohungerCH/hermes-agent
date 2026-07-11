@@ -97,31 +97,22 @@ def test_flags_default_off(monkeypatch):
     assert vw.vault_write_enabled() is False
 
 
-def test_default_config_seeds_vault_live_state():
-    """§8b-Härtung: der versionierte DEFAULT_CONFIG trägt den Live-Zustand des
-    Vault (all-on + hybrid). Verhindert, dass ein Volume-Reseed den Vault still
-    dunkel schaltet -- und dass jemand den Seed versehentlich entfernt.
+def test_default_config_does_not_seed_vault_flags():
+    """Migration 0.16->0.18.2 (Fork-Lock-Fix): der Vault-Flag-Seed lebt NICHT mehr
+    im Kern-DEFAULT_CONFIG (das war ein Motor-Kern-Edit = Fork-Lock, vgl. Memory
+    engine-must-be-commodity-swappable-no-core-edits). Er gehört in ein externes
+    config_file (Fabel-5-Aktivierung, siehe docs/llm/2026-07-11_HANDOFF_fabel5-*).
+    Dieser Test verhindert die versehentliche Re-Einführung des Kern-Seeds. Bis der
+    externe Seed steht, bleiben die Vault-Flags default-aus (_vault_flag() -> False),
+    was fail-closed korrekt ist (Vault-Write/Recall inert).
     """
-    from hermes_cli.config import DEFAULT_CONFIG, _deep_merge, cfg_get
+    from hermes_cli.config import DEFAULT_CONFIG
 
-    seed = DEFAULT_CONFIG.get("vault")
-    assert seed == {
-        "plumbing_enabled": True,
-        "write_enabled": True,
-        "recall_enabled": True,
-        "recall_mode": "hybrid",
-    }
-
-    # Self-Heal-Beweis: eine User-config.yaml OHNE vault-Block (wie nach einem
-    # Reseed) erbt die Seed-Werte über den Deep-Merge, den load_config() fährt.
-    merged = _deep_merge(DEFAULT_CONFIG, {"model": {"default": "x"}})
-    assert cfg_get(merged, "vault", "recall_mode") == "hybrid"
-    assert cfg_get(merged, "vault", "write_enabled") is True
-
-    # Reversibilität: ein User-Override gewinnt weiterhin pro Key (Live-Flip).
-    off = _deep_merge(DEFAULT_CONFIG, {"vault": {"recall_mode": "tsvector"}})
-    assert cfg_get(off, "vault", "recall_mode") == "tsvector"
-    assert cfg_get(off, "vault", "write_enabled") is True  # unberührter Key bleibt
+    vault_block = DEFAULT_CONFIG.get("vault") or {}
+    seeded = {"plumbing_enabled", "write_enabled", "recall_enabled", "recall_mode"} & set(vault_block)
+    assert not seeded, (
+        f"Vault-Flag-Seed darf NICHT in DEFAULT_CONFIG stehen (Fork-Lock), fand: {seeded}"
+    )
 
 
 def test_write_implies_path_active(monkeypatch):

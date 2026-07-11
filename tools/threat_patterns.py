@@ -33,10 +33,11 @@ the rationale on borderline cases.
 
 Multi-word bypass
 -----------------
-Patterns use ``(?:\\w+\\s+)*`` between key tokens to prevent attackers
-from inserting filler words (e.g. "ignore all prior instructions" instead
-of "ignore all instructions").  This mirrors the fix applied to
-``skills_guard.py`` in commit 4ea29978.
+Patterns use bounded ``(?:\\w+\\s+){0,8}`` filler between key tokens to prevent
+attackers from inserting a handful of words (e.g. "ignore all prior
+instructions" instead of "ignore all instructions") without allowing unbounded
+regex backtracking. This mirrors the fix applied to ``skills_guard.py`` in
+commit 4ea29978.
 """
 
 from __future__ import annotations
@@ -44,6 +45,18 @@ from __future__ import annotations
 import re
 import unicodedata
 from typing import List, Optional, Tuple
+
+# Hard cap on text scanned with regexes.  Context/tool-result strings can be
+# arbitrarily large, and the scanners are advisory guards rather than archival
+# search; bounding input keeps worst-case runtime predictable while preserving
+# detections near the beginning of injected content.
+MAX_SCAN_CHARS = 65_536
+
+# Bounded filler used between key attack words.  Earlier patterns used
+# ``(?:\w+\s+)*`` which is ambiguous and can backtrack heavily on adversarial
+# near-misses.  Eight filler words is enough for the intended obfuscation
+# bypasses without introducing unbounded repetition.
+_FILLER = r"(?:\w+\s+){0,8}"
 
 # Each entry: (regex, pattern_id, scope, severity)
 # scope ∈ {"all", "context", "strict"}
@@ -53,22 +66,22 @@ from typing import List, Optional, Tuple
 #           never blocks a durable write.
 _PATTERNS: List[Tuple[str, str, str, str]] = [
     # ── Classic prompt injection (applies everywhere) ────────────────
-    (r'ignore\s+(?:\w+\s+)*(previous|all|above|prior)\s+(?:\w+\s+)*(instructions|rules|guidelines|directives|policies|prompts)', "prompt_injection", "all", "block"),
+    (rf'ignore\s+{_FILLER}(previous|all|above|prior)\s+{_FILLER}(instructions|rules|guidelines|directives|policies|prompts)', "prompt_injection", "all", "block"),
     (r'system\s+prompt\s+override', "sys_prompt_override", "all", "block"),
-    (r'disregard\s+(?:\w+\s+)*(your|all|any)\s+(?:\w+\s+)*(instructions|rules|guidelines)', "disregard_rules", "all", "block"),
-    (r'act\s+as\s+(if|though)\s+(?:\w+\s+)*you\s+(?:\w+\s+)*(have\s+no|don\'t\s+have)\s+(?:\w+\s+)*(restrictions|limits|rules)', "bypass_restrictions", "all", "block"),
-    (r'<!--[^>]*(?:ignore|override|system|secret|hidden)[^>]*-->', "html_comment_injection", "all", "block"),
-    (r'<\s*div\s+style\s*=\s*["\'][\s\S]*?display\s*:\s*none', "hidden_div", "all", "block"),
-    (r'translate\s+.*\s+into\s+.*\s+and\s+(execute|run|eval)', "translate_execute", "all", "block"),
-    (r'do\s+not\s+(?:\w+\s+)*tell\s+(?:\w+\s+)*the\s+user', "deception_hide", "all", "block"),
+    (rf'disregard\s+{_FILLER}(your|all|any)\s+{_FILLER}(instructions|rules|guidelines)', "disregard_rules", "all", "block"),
+    (rf'act\s+as\s+(if|though)\s+{_FILLER}you\s+{_FILLER}(have\s+no|don\'t\s+have)\s+{_FILLER}(restrictions|limits|rules)', "bypass_restrictions", "all", "block"),
+    (r'<!--[^>]{0,512}(?:ignore|override|system|secret|hidden)[^>]{0,512}-->', "html_comment_injection", "all", "block"),
+    (r'<\s*div\s+style\s*=\s*["\'][^>]{0,2048}display\s*:\s*none', "hidden_div", "all", "block"),
+    (r'translate\s+[^\n]{0,512}\s+into\s+[^\n]{0,512}\s+and\s+(execute|run|eval)', "translate_execute", "all", "block"),
+    (rf'do\s+not\s+{_FILLER}tell\s+{_FILLER}the\s+user', "deception_hide", "all", "block"),
 
     # ── Role-play / identity hijack (context + strict; common attack
     #    surface in scraped web content and poisoned context files) ──
-    (r'you\s+are\s+(?:\w+\s+)*now\s+(?:a|an|the)\s+', "role_hijack", "context", "block"),
-    (r'pretend\s+(?:\w+\s+)*(you\s+are|to\s+be)\s+', "role_pretend", "context", "block"),
-    (r'output\s+(?:\w+\s+)*(system|initial)\s+prompt', "leak_system_prompt", "context", "block"),
-    (r'(respond|answer|reply)\s+without\s+(?:\w+\s+)*(restrictions|limitations|filters|safety)', "remove_filters", "context", "block"),
-    (r'you\s+have\s+been\s+(?:\w+\s+)*(updated|upgraded|patched)\s+to', "fake_update", "context", "block"),
+    (rf'you\s+are\s+{_FILLER}now\s+(?:a|an|the)\s+', "role_hijack", "context", "block"),
+    (rf'pretend\s+{_FILLER}(you\s+are|to\s+be)\s+', "role_pretend", "context", "block"),
+    (rf'output\s+{_FILLER}(system|initial)\s+prompt', "leak_system_prompt", "context", "block"),
+    (rf'(respond|answer|reply)\s+without\s+{_FILLER}(restrictions|limitations|filters|safety)', "remove_filters", "context", "block"),
+    (rf'you\s+have\s+been\s+{_FILLER}(updated|upgraded|patched)\s+to', "fake_update", "context", "block"),
     # "name yourself X" is a Brainworm-specific tell — identity override
     # via spec instead of jailbreak.  Anchored on the verb pair so it
     # doesn't match "name your variables" etc.
@@ -125,32 +138,37 @@ _PATTERNS: List[Tuple[str, str, str, str]] = [
     # Anti-forensic instructions ("never write to disk", "one-liners only")
     # — extremely unusual in legitimate content; near-zero false positive.
     (r'only\s+use\s+one[\s\-]?liners?\b', "anti_forensic_oneliner", "context", "warn"),
-    (r'never\s+(?:\w+\s+)*(?:create|write)\s+(?:\w+\s+)*(?:script|file)\s+(?:\w+\s+)*disk', "anti_forensic_disk", "context", "warn"),
+    (rf'never\s+{_FILLER}(?:create|write)\s+{_FILLER}(?:script|file)\s+{_FILLER}disk', "anti_forensic_disk", "context", "warn"),
     # Environment-variable unsetting targeting known agent runtimes —
     # this is pure attack behavior (Brainworm sub-session bypass).
     (r'unset\s+\w*(?:CLAUDE|CODEX|HERMES|AGENT|OPENAI|ANTHROPIC)\w*', "env_var_unset_agent", "context", "warn"),
 
     # ── Known C2 / red-team framework names (near-zero false positive
-    #    outside security research; warn-only). "praxis" REMOVED (GAP-D):
-    #    it is the German everyday word "Praxis" (doctor's office / practice),
-    #    not a framework name — a real owner false positive. ─────────────
+    #    outside security research; warn-only by default) ─────────────
+    # NOTE: do not add common English words here. Every token must be a
+    # distinctive offensive-security tool brand, otherwise legitimate
+    # AGENTS.md / SOUL.md content false-positives and the whole file is
+    # blocked. "praxis" was removed for exactly this reason — it's a common
+    # word and a legitimate agent name (Greek for practice/action), and in
+    # our owner context also the German everyday word "Praxis" (doctor's
+    # office / practice), not a C2-specific tell like the brands below.
     (r'\b(?:cobalt\s*strike|sliver|havoc|mythic|metasploit|brainworm)\b', "known_c2_framework", "context", "warn"),
     (r'\bc2\s+(?:server|channel|infrastructure|beacon)\b', "c2_explicit", "context", "warn"),
     (r'\bcommand\s+and\s+control\b', "c2_explicit_long", "context", "warn"),
 
     # ── Exfiltration via curl/wget/cat with secrets (applies everywhere) ──
-    (r'curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_curl", "all", "block"),
-    (r'wget\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_wget", "all", "block"),
-    (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)', "read_secrets", "all", "block"),
-    (r'(send|post|upload|transmit)\s+.*\s+(to|at)\s+https?://', "send_to_url", "strict", "block"),
-    (r'(include|output|print|share)\s+(?:\w+\s+)*(conversation|chat\s+history|previous\s+messages|full\s+context|entire\s+context)', "context_exfil", "strict", "block"),
+    (r'curl\s+[^\n]{0,2048}\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_curl", "all", "block"),
+    (r'wget\s+[^\n]{0,2048}\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_wget", "all", "block"),
+    (r'cat\s+[^\n]{0,2048}(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)', "read_secrets", "all", "block"),
+    (r'(send|post|upload|transmit)\s+[^\n]{0,2048}\s+(to|at)\s+https?://', "send_to_url", "strict", "block"),
+    (rf'(include|output|print|share)\s+{_FILLER}(conversation|chat\s+history|previous\s+messages|full\s+context|entire\s+context)', "context_exfil", "strict", "block"),
 
     # ── Persistence / SSH backdoor (strict scope — memory + skills) ──
     (r'authorized_keys', "ssh_backdoor", "strict", "block"),
     (r'\$HOME/\.ssh|\~/\.ssh', "ssh_access", "strict", "block"),
     (r'\$HOME/\.hermes/\.env|\~/\.hermes/\.env', "hermes_env", "strict", "block"),
-    (r'(update|modify|edit|write|change|append|add\s+to)\s+.*(?:AGENTS\.md|CLAUDE\.md|\.cursorrules|\.clinerules)', "agent_config_mod", "strict", "block"),
-    (r'(update|modify|edit|write|change|append|add\s+to)\s+.*\.hermes/(config\.yaml|SOUL\.md)', "hermes_config_mod", "strict", "block"),
+    (r'(update|modify|edit|write|change|append|add\s+to)\s+[^\n]{0,2048}(?:AGENTS\.md|CLAUDE\.md|\.cursorrules|\.clinerules)', "agent_config_mod", "strict", "block"),
+    (r'(update|modify|edit|write|change|append|add\s+to)\s+[^\n]{0,2048}\.hermes/(config\.yaml|SOUL\.md)', "hermes_config_mod", "strict", "block"),
 
     # ── Hardcoded secrets ────────────────────────────────────────────
     (r'(?:api[_-]?key|token|secret|password)\s*[=:]\s*["\'][A-Za-z0-9+/=_-]{20,}', "hardcoded_secret", "strict", "block"),
@@ -304,6 +322,8 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
 
     findings: List[str] = []
 
+    content = content[:MAX_SCAN_CHARS]
+
     # Invisible unicode — detected on the RAW content (normalize() does not
     # touch the invisible set; this finding IS the zero-width-split detector).
     char_set = set(content)
@@ -312,6 +332,10 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
         findings.append(f"invisible_unicode_U+{ord(ch):04X}")
 
     # Threat patterns — matched on the normalized view (GAP-D Stufe 0).
+    # normalize() strictly supersedes upstream's NFKC-only fold: it does NFKC
+    # AND the Cyrillic/Greek homoglyph fold AND line-break joins, so it also
+    # covers the cross-script confusables (Cyrillic ``а`` U+0430) that a bare
+    # unicodedata.normalize("NFKC", ...) leaves untouched.
     normalized = normalize(content)
     patterns = _COMPILED.get(scope)
     if patterns is None:
@@ -424,6 +448,7 @@ def first_threat_message(content: str, scope: str = "strict") -> Optional[str]:
 
 __all__ = [
     "INVISIBLE_CHARS",
+    "MAX_SCAN_CHARS",
     "normalize",
     "scan_for_threats",
     "classify_threats",
