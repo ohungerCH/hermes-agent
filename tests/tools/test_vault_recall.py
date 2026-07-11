@@ -213,11 +213,17 @@ def test_wrap_ampersand_encoded_first():
 # vault_shadow_recall() -- No-ops + Wrap + fail-soft
 # ---------------------------------------------------------------------------
 
-def _arm(monkeypatch, *, enabled=True, origin="assistant_tool", identity=("t1", "o1")):
+def _arm(monkeypatch, *, enabled=True, origin="assistant_tool", identity=("t1", "o1"),
+         recall_mode="tsvector"):
     monkeypatch.setattr(vw, "vault_recall_enabled", lambda: enabled)
     monkeypatch.setattr(vw, "get_vault_write_identity", lambda: identity)
     import tools.write_approval as wa
     monkeypatch.setattr(wa, "current_origin", lambda: origin)
+    # recall_mode explizit pinnen: diese Tests sind für den tsvector-Pfad
+    # geschrieben. Ohne Pin erben sie den DEFAULT_CONFIG-Seed ('hybrid',
+    # §8b-Härtung) und der Recall würde den Embed-Server rufen. Hybrid-/KNN-
+    # Pfade werden in test_vault_flaeche_b.py mit eigenem Pin geprüft.
+    monkeypatch.setattr(vw, "vault_recall_mode", lambda: recall_mode)
 
 
 def test_shadow_recall_noop_when_flag_off(monkeypatch):

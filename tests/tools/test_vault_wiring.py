@@ -16,9 +16,13 @@ from tools.vault import vault_wiring as vw
 # Helpers / Fakes
 # ---------------------------------------------------------------------------
 
-def _flags(monkeypatch, *, plumbing=False, write=False):
+def _flags(monkeypatch, *, plumbing=False, write=False, recall_mode="tsvector"):
     table = {"plumbing_enabled": plumbing, "write_enabled": write}
     monkeypatch.setattr(vw, "_vault_flag", lambda name: table.get(name, False))
+    # recall_mode explizit pinnen: sonst erbt der Test den DEFAULT_CONFIG-Seed
+    # ('hybrid', §8b-Härtung) und der async-Embed-Daemon feuert nach dem Write
+    # -> borgt eine zweite Connection und bricht die borrowed==1-Invariante.
+    monkeypatch.setattr(vw, "vault_recall_mode", lambda: recall_mode)
 
 
 def _foreground(monkeypatch, origin="foreground"):
@@ -91,6 +95,33 @@ def test_flags_default_off(monkeypatch):
     monkeypatch.setattr(vw, "_vault_flag", lambda name: False)
     assert vw.vault_path_active() is False
     assert vw.vault_write_enabled() is False
+
+
+def test_default_config_seeds_vault_live_state():
+    """§8b-Härtung: der versionierte DEFAULT_CONFIG trägt den Live-Zustand des
+    Vault (all-on + hybrid). Verhindert, dass ein Volume-Reseed den Vault still
+    dunkel schaltet -- und dass jemand den Seed versehentlich entfernt.
+    """
+    from hermes_cli.config import DEFAULT_CONFIG, _deep_merge, cfg_get
+
+    seed = DEFAULT_CONFIG.get("vault")
+    assert seed == {
+        "plumbing_enabled": True,
+        "write_enabled": True,
+        "recall_enabled": True,
+        "recall_mode": "hybrid",
+    }
+
+    # Self-Heal-Beweis: eine User-config.yaml OHNE vault-Block (wie nach einem
+    # Reseed) erbt die Seed-Werte über den Deep-Merge, den load_config() fährt.
+    merged = _deep_merge(DEFAULT_CONFIG, {"model": {"default": "x"}})
+    assert cfg_get(merged, "vault", "recall_mode") == "hybrid"
+    assert cfg_get(merged, "vault", "write_enabled") is True
+
+    # Reversibilität: ein User-Override gewinnt weiterhin pro Key (Live-Flip).
+    off = _deep_merge(DEFAULT_CONFIG, {"vault": {"recall_mode": "tsvector"}})
+    assert cfg_get(off, "vault", "recall_mode") == "tsvector"
+    assert cfg_get(off, "vault", "write_enabled") is True  # unberührter Key bleibt
 
 
 def test_write_implies_path_active(monkeypatch):

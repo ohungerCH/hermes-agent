@@ -2650,6 +2650,20 @@ DEFAULT_CONFIG = {
     "paste_collapse_threshold_fallback": 5,
     "paste_collapse_char_threshold": 2000,
 
+    # Personal Context Vault (per-owner RLS-isolierter Gedächtnisspeicher).
+    # Versionierter Seed der Live-Flags: ein Volume-Reseed stellt den Vault
+    # damit exakt so wieder her, wie er jetzt läuft (§8b-Härtung). Der
+    # Volume-Block in config.yaml überschreibt diese Werte weiterhin pro Key
+    # (Live-Flips bleiben reversibel, weil User-Keys im Deep-Merge gewinnen).
+    # Zweite Verteidigungslinie: _vault_flag()/vault_recall_mode() defaulten
+    # bei einem Load-Fehler auf False bzw. 'tsvector' (fail-closed) -- diese
+    # Seed-Werte sind der intendierte Normalbetrieb, nicht der Notnagel.
+    "vault": {
+        "plumbing_enabled": True,
+        "write_enabled": True,
+        "recall_enabled": True,
+        "recall_mode": "hybrid",
+    },
 
     # Config schema version - bump this when adding new required fields
     "_config_version": 30,
