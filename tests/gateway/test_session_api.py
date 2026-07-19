@@ -229,7 +229,9 @@ async def test_trusted_surface_chat_loads_history_and_uses_server_session_key(
     _, kwargs = mock_run.call_args
     assert kwargs["session_id"] == session_id
     assert kwargs["gateway_session_key"].startswith("trusted_surface:")
-    assert kwargs["enabled_toolsets_override"] is None
+    assert kwargs["enabled_toolsets_override"] == []
+    assert kwargs["vault_tenant_id"] is None
+    assert kwargs["vault_owner_id"] is None
     history = kwargs["conversation_history"]
     assert len(history) == 2
     assert history[0]["role"] == "user"
@@ -239,7 +241,7 @@ async def test_trusted_surface_chat_loads_history_and_uses_server_session_key(
     prompt = kwargs["ephemeral_system_prompt"]
     assert isinstance(prompt, str)
     assert "trusted surface live-slice contract" in prompt.lower()
-    assert "persistent memory writes" in prompt.lower()
+    assert "persistent memory changes" in prompt.lower()
     assert "must never claim" in prompt.lower()
     assert "scratchpad/docs note writes may be prepared here" in prompt.lower()
     assert "explicit confirmation flow" in prompt.lower()
@@ -251,6 +253,7 @@ async def test_trusted_surface_chat_loads_history_and_uses_server_session_key(
     assert "research.request" in prompt
     assert "sms.send" in prompt
     assert "media.play" in prompt
+    assert "memory.manage" in prompt
 
 
 @pytest.mark.asyncio
@@ -294,7 +297,8 @@ async def test_trusted_surface_chat_passes_direct_kanban_toolset_override(
     prompt = kwargs["ephemeral_system_prompt"]
     assert "direct hermes toolsets live today on this path: kanban" in prompt.lower()
     assert "use the direct kanban tools" in prompt.lower()
-    assert "durable memory writes are not live on this path yet" in prompt.lower()
+    assert "memory.manage" in prompt.lower()
+    assert "never use a direct memory tool" in prompt.lower()
     assert "skill creation or edits are not live on this path yet" in prompt.lower()
 
 
@@ -312,7 +316,16 @@ async def test_trusted_surface_memory_request_reaches_model_when_memory_lane_is_
     mock_run = AsyncMock(
         return_value=(
             {
-                "final_response": "Ich habe mir notiert, dass Martin am Donnerstag telefonieren will.",
+                "final_response": (
+                    "Ich bereite die Erinnerung zur Bestätigung vor."
+                    "<<<JARVIS_ACTION_INTENT>>>"
+                    '{"type":"jarvis.action.intent","intent_id":"memory-add-1",'
+                    '"action":"memory.manage","params":{"skill_name":"hermes-agent",'
+                    '"operation":"add","target":"memory","content":'
+                    '"Martin will am Donnerstag telefonieren."},'
+                    '"provenance":{"content":"owner_spoken"}}'
+                    "<<<END_JARVIS_ACTION_INTENT>>>"
+                ),
                 "session_id": session_id,
             },
             {"total_tokens": 8},
@@ -338,13 +351,15 @@ async def test_trusted_surface_memory_request_reaches_model_when_memory_lane_is_
 
     mock_run.assert_awaited_once()
     assert payload["message"]["content"] == (
-        "Ich habe mir notiert, dass Martin am Donnerstag telefonieren will."
+        "Ich bereite die Erinnerung zur Bestätigung vor."
     )
+    assert payload["action_intent"][0]["action"] == "memory.manage"
     _, kwargs = mock_run.call_args
-    assert kwargs["enabled_toolsets_override"] == ["kanban", "memory", "skills"]
+    assert kwargs["enabled_toolsets_override"] == ["kanban", "skills"]
     prompt = kwargs["ephemeral_system_prompt"].lower()
-    assert "durable memory writes are live here via the direct memory tool" in prompt
-    assert "store only the distilled note" in prompt
+    assert "memory.manage" in prompt
+    assert "explicit owner confirmation" in prompt
+    assert "never use a direct memory tool" in prompt
     assert "skill creation and edits are live here via the direct skills tools" in prompt
 
 
@@ -436,7 +451,7 @@ async def test_trusted_surface_chat_rejects_foreign_session_and_client_session_k
 
 
 @pytest.mark.asyncio
-async def test_trusted_surface_memory_request_is_answered_honestly_without_model_run(
+async def test_trusted_surface_memory_request_uses_confirmed_action_intent_not_direct_tool(
     trusted_surface_adapter,
     session_db,
 ):
@@ -448,7 +463,19 @@ async def test_trusted_surface_memory_request_is_answered_honestly_without_model
     )
     mock_run = AsyncMock(
         return_value=(
-            {"final_response": "should not run", "session_id": session_id},
+            {
+                "final_response": (
+                    "Ich bereite die Erinnerung zur Bestätigung vor."
+                    "<<<JARVIS_ACTION_INTENT>>>"
+                    '{"type":"jarvis.action.intent","intent_id":"memory-add-2",'
+                    '"action":"memory.manage","params":{"skill_name":"hermes-agent",'
+                    '"operation":"add","target":"memory","content":'
+                    '"Martin will am Donnerstag telefonieren."},'
+                    '"provenance":{"content":"owner_spoken"}}'
+                    "<<<END_JARVIS_ACTION_INTENT>>>"
+                ),
+                "session_id": session_id,
+            },
             {"total_tokens": 9},
         )
     )
@@ -463,22 +490,18 @@ async def test_trusted_surface_memory_request_is_answered_honestly_without_model
             assert resp.status == 200
             payload = await resp.json()
 
-    mock_run.assert_not_awaited()
+    mock_run.assert_awaited_once()
     assert payload["message"]["content"] == (
-        "Ich behalte das für diesen Gesprächsverlauf im Kontext. "
-        "Dauerhaft gespeichert ist es hier im Owner-Modus noch nicht."
+        "Ich bereite die Erinnerung zur Bestätigung vor."
     )
-    assert payload["usage"] == {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-    }
-    messages = session_db.get_messages(session_id)
-    assert [m["role"] for m in messages[-2:]] == ["user", "assistant"]
-    assert messages[-1]["content"] == (
-        "Ich behalte das für diesen Gesprächsverlauf im Kontext. "
-        "Dauerhaft gespeichert ist es hier im Owner-Modus noch nicht."
-    )
+    assert payload["action_intent"][0]["action"] == "memory.manage"
+    _, kwargs = mock_run.call_args
+    assert kwargs["enabled_toolsets_override"] == []
+    assert kwargs["vault_tenant_id"] is None
+    assert kwargs["vault_owner_id"] is None
+    prompt = kwargs["ephemeral_system_prompt"].lower()
+    assert "memory.manage" in prompt
+    assert "never use a direct memory tool" in prompt
 
 
 @pytest.mark.asyncio

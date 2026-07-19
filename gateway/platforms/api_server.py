@@ -333,10 +333,10 @@ def _trusted_surface_live_slice_memory_reply(user_message: Any) -> Optional[str]
     return None
 
 
-_TRUSTED_SURFACE_DIRECT_TOOLSETS = frozenset({"kanban", "memory", "skills"})
+_TRUSTED_SURFACE_DIRECT_TOOLSETS = frozenset({"kanban", "skills"})
 _TRUSTED_SURFACE_ACTION_INTENT_CAPABILITIES = (
     "docs.read, docs.search, docs.write, m365.read, research.request, "
-    "sms.send, media.play"
+    "sms.send, media.play, memory.manage"
 )
 
 
@@ -2086,8 +2086,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 "- If a request would need more than one durable or tool-opening step, ask a "
                 "clarifying question or take the first safe live step instead of emitting "
                 "multiple action-intent candidates.\n"
-                "- Persistent memory writes, kanban mutations, skill creation or edits, "
-                "reminders, and other durable side effects are not live on this path yet.\n"
+                "- Persistent memory changes use memory.manage and always require the "
+                "separate explicit Owner confirmation card. Never use a direct memory tool "
+                "on this surface.\n"
+                "- For memory.manage use exactly one action intent with params: skill_name "
+                "(hermes-agent or research-paper-writing), operation "
+                "(add/replace/remove/batch/recall), target (memory or user), and only the "
+                "operation-specific content, old_text, operations, query, or limit fields.\n"
+                "- Kanban mutations, skill creation or edits, reminders, and other durable "
+                "side effects are not live on this path yet.\n"
                 "- Scratchpad/docs note writes may be prepared here, but they only count as "
                 "real after an explicit confirmation flow and an actual server-side result "
                 "or receipt in this turn.\n"
@@ -2113,26 +2120,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 "- For kanban work, use the direct kanban tools instead of faking cards or "
                 "status changes in prose. A task exists only after the tool call succeeds.\n"
             )
-        if "memory" in direct_toolsets:
-            direct_live_lines.append(
-                "- Durable memory writes are live here via the direct memory tool. Save concise, "
-                "owner-meaningful notes, not raw dumps of foreign content.\n"
-            )
-            direct_live_lines.append(
-                "- When the user wants to remember content that came from mail, SMS, docs, "
-                "diagnostics, timeline, OBD2, or similar foreign sources, take the safe indirect "
-                "path silently: read first, distill the point in your own words, then store only "
-                "the distilled note once the owner's intent is clear.\n"
-            )
-            direct_live_lines.append(
-                "- Do not claim a memory is durably stored unless the direct memory tool actually "
-                "succeeded in this turn.\n"
-            )
-        else:
-            direct_live_lines.append(
-                "- Durable memory writes are not live on this path yet. If the user asks for a "
-                "lasting memory, be honest and keep it only in the current conversation context.\n"
-            )
+        direct_live_lines.append(
+            "- Persistent memory changes never use a direct memory tool on this surface. "
+            "Emit exactly one memory.manage action intent and wait for the separate explicit "
+            "Owner confirmation and server-side result before claiming it was stored.\n"
+        )
+        direct_live_lines.append(
+            "- For memory.manage use params skill_name "
+            "(hermes-agent or research-paper-writing), operation "
+            "(add/replace/remove/batch/recall), target (memory or user), and only the "
+            "operation-specific content, old_text, operations, query, or limit fields.\n"
+        )
         if "skills" in direct_toolsets:
             direct_live_lines.append(
                 "- Skill creation and edits are live here via the direct skills tools. Use them "
@@ -2316,29 +2314,6 @@ class APIServerAdapter(BasePlatformAdapter):
             identity, session_id
         )
         direct_toolsets = self._trusted_surface_live_toolsets(identity)
-        deterministic_reply = None
-        if "memory" not in direct_toolsets:
-            deterministic_reply = _trusted_surface_live_slice_memory_reply(user_message)
-        if deterministic_reply is not None:
-            db = self._ensure_session_db()
-            if db is not None:
-                db.append_message(session_id, "user", user_message)
-                db.append_message(session_id, "assistant", deterministic_reply)
-            headers = {"X-Hermes-Session-Id": session_id}
-            return web.json_response(
-                {
-                    "object": "hermes.trusted_surface.chat.completion",
-                    "surface": "trusted_surface",
-                    "session_id": session_id,
-                    "message": {"role": "assistant", "content": deterministic_reply},
-                    "usage": {
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "total_tokens": 0,
-                    },
-                },
-                headers=headers,
-            )
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
@@ -2346,13 +2321,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 direct_toolsets
             ),
             session_id=session_id,
-            enabled_toolsets_override=direct_toolsets or None,
+            enabled_toolsets_override=direct_toolsets,
             gateway_session_key=gateway_session_key,
             # Vault-Schreib-Identität (§5c): server-autoritativ aus der Trusted-Surface-Session,
             # client-unfälschbar. NUR dieser Pfad hat einen aufgelösten Owner -> nur er speist den
             # dark-wire; alle anderen _run_agent-Aufrufer lassen die Defaults None = No-op.
-            vault_tenant_id=identity.tenant_id,
-            vault_owner_id=identity.owner_id,
+            vault_tenant_id=None,
+            vault_owner_id=None,
         )
         effective_session_id = (
             result.get("session_id") if isinstance(result, dict) else session_id
