@@ -281,12 +281,30 @@ def _load_trusted_surface_server_task_projection() -> Dict[str, Any]:
         projection["status"] = "available"
         projection["tasks"] = tasks
     return projection
+
+
 _TRUSTED_SURFACE_ENGLISH_MEMORY_REQUEST_MARKERS = (
     "remember this",
     "remember that",
     "save this",
     "store this",
     "memorize this",
+)
+_TRUSTED_SURFACE_EXPLICIT_MEMORY_COMMAND_RE = re.compile(
+    r"\Amerke\s+dir\s+mit\s+"
+    r"(?P<skill_name>[A-Za-z0-9][A-Za-z0-9._-]{0,63})"
+    r"\s+dauerhaft\s*:\s*(?P<content>.*)\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+_TRUSTED_SURFACE_MEMORY_SKILLS = frozenset(
+    {"hermes-agent", "research-paper-writing"}
+)
+_TRUSTED_SURFACE_MEMORY_SAFE_FAILURE_REPLY = (
+    "Ich konnte keine bestätigbare Memory-Aktion vorbereiten. "
+    "Es wurde nichts dauerhaft gespeichert oder geändert."
+)
+_TRUSTED_SURFACE_MEMORY_CONFIRM_REPLY = (
+    "Ich bereite die Memory-Aktion zur Bestätigung vor."
 )
 
 
@@ -315,22 +333,82 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
-def _trusted_surface_live_slice_memory_reply(user_message: Any) -> Optional[str]:
+def _trusted_surface_memory_safe_failure_reply(user_message: Any) -> Optional[str]:
     text = _normalize_chat_content(user_message).strip()
     if not text:
         return None
     lowered = text.lower()
     if any(marker in lowered for marker in _TRUSTED_SURFACE_GERMAN_MEMORY_REQUEST_MARKERS):
-        return (
-            "Ich behalte das für diesen Gesprächsverlauf im Kontext. "
-            "Dauerhaft gespeichert ist es hier im Owner-Modus noch nicht."
-        )
+        return _TRUSTED_SURFACE_MEMORY_SAFE_FAILURE_REPLY
     if any(marker in lowered for marker in _TRUSTED_SURFACE_ENGLISH_MEMORY_REQUEST_MARKERS):
         return (
-            "I can keep that in this conversation context, "
-            "but it is not durably stored on this trusted-surface path yet."
+            "I could not prepare a confirmable memory action. "
+            "Nothing was permanently stored or changed."
         )
     return None
+
+
+def _trusted_surface_explicit_memory_action_intent(
+    user_message: Any,
+    *,
+    session_id: str,
+) -> tuple[bool, Optional[list[Dict[str, Any]]]]:
+    """Normalize the closed Owner-Chat Memory command without model routing.
+
+    ``Merke dir mit <skill> dauerhaft: <content>`` is the physical canary and
+    operator command grammar.  The model must not be able to reinterpret it as
+    Kanban/skills work or claim success without an action intent.  This helper
+    only builds inert request data; the separate Owner confirmation and the v2
+    Gate/Final-Wire path remain the sole authority.
+
+    The boolean distinguishes "not this grammar" from "recognized but invalid".
+    Recognized invalid commands fail closed and must never fall back to tools.
+    """
+    text = _normalize_chat_content(user_message).strip()
+    if not text:
+        return False, None
+    match = _TRUSTED_SURFACE_EXPLICIT_MEMORY_COMMAND_RE.fullmatch(text)
+    if match is None:
+        return False, None
+
+    skill_name = match.group("skill_name").lower()
+    content = match.group("content").strip()
+    if (
+        skill_name not in _TRUSTED_SURFACE_MEMORY_SKILLS
+        or not content
+        or len(content) > 2200
+        or len(content.encode("utf-8")) > 8800
+    ):
+        return True, None
+    for char in content:
+        number = ord(char)
+        if number == 0x7F or number < 0x20 and char not in {"\n", "\t"}:
+            return True, None
+
+    # ``add`` is content-idempotent: the same normalized command in the same
+    # server-scoped session is one semantic request, including transport
+    # retransmissions.  A separate session gets a separate request identity.
+    intent_seed = f"{session_id}\0{text}".encode("utf-8")
+    intent_id = f"memory-add-{hashlib.sha256(intent_seed).hexdigest()[:32]}"
+    return True, [
+        {
+            "type": "jarvis.action.intent",
+            "intent_id": intent_id,
+            "action": "memory.manage",
+            "params": {
+                "skill_name": skill_name,
+                "operation": "add",
+                "target": "memory",
+                "content": content,
+            },
+            "provenance": {
+                "skill_name": "owner_spoken",
+                "operation": "owner_spoken",
+                "target": "owner_spoken",
+                "content": "owner_spoken",
+            },
+        }
+    ]
 
 
 _TRUSTED_SURFACE_DIRECT_TOOLSETS = frozenset({"kanban", "skills"})
@@ -2343,6 +2421,64 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
+
+        memory_safe_reply = _trusted_surface_memory_safe_failure_reply(
+            user_message
+        )
+        explicit_memory_command, memory_action_intent = (
+            _trusted_surface_explicit_memory_action_intent(
+                user_message,
+                session_id=session_id,
+            )
+        )
+        if explicit_memory_command or memory_safe_reply is not None:
+            visible_reply = (
+                _TRUSTED_SURFACE_MEMORY_CONFIRM_REPLY
+                if memory_action_intent is not None
+                else (
+                    memory_safe_reply
+                    or _TRUSTED_SURFACE_MEMORY_SAFE_FAILURE_REPLY
+                )
+            )
+            try:
+                db = self._ensure_session_db()
+                if db is None:
+                    raise RuntimeError("trusted_surface_session_store_unavailable")
+                db.append_messages_atomic(
+                    session_id,
+                    [
+                        {"role": "user", "content": user_message},
+                        {"role": "assistant", "content": visible_reply},
+                    ],
+                )
+            except Exception:
+                logger.exception(
+                    "Trusted-surface deterministic Memory turn could not be persisted"
+                )
+                return web.json_response(
+                    _openai_error(
+                        "Trusted surface could not persist the Memory turn.",
+                        code="trusted_surface_memory_turn_persist_failed",
+                    ),
+                    status=503,
+                )
+            response_body: Dict[str, Any] = {
+                "object": "hermes.trusted_surface.chat.completion",
+                "surface": "trusted_surface",
+                "session_id": session_id,
+                "message": {"role": "assistant", "content": visible_reply},
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+            if memory_action_intent is not None:
+                response_body["action_intent"] = memory_action_intent
+            return web.json_response(
+                response_body,
+                headers={"X-Hermes-Session-Id": session_id},
+            )
 
         history = self._conversation_history_for_session(session_id)
         gateway_session_key = self._trusted_surface_gateway_session_key(

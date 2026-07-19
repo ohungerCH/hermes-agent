@@ -303,7 +303,7 @@ async def test_trusted_surface_chat_passes_direct_kanban_toolset_override(
 
 
 @pytest.mark.asyncio
-async def test_trusted_surface_memory_request_reaches_model_when_memory_lane_is_live(
+async def test_trusted_surface_unscoped_memory_add_is_rejected_without_model_tools(
     trusted_surface_adapter,
     session_db,
 ):
@@ -349,18 +349,291 @@ async def test_trusted_surface_memory_request_reaches_model_when_memory_lane_is_
             assert resp.status == 200
             payload = await resp.json()
 
-    mock_run.assert_awaited_once()
+    mock_run.assert_not_awaited()
+    assert "action_intent" not in payload
     assert payload["message"]["content"] == (
-        "Ich bereite die Erinnerung zur Bestätigung vor."
+        "Ich konnte keine bestätigbare Memory-Aktion vorbereiten. "
+        "Es wurde nichts dauerhaft gespeichert oder geändert."
     )
-    assert payload["action_intent"][0]["action"] == "memory.manage"
-    _, kwargs = mock_run.call_args
-    assert kwargs["enabled_toolsets_override"] == ["kanban", "skills"]
-    prompt = kwargs["ephemeral_system_prompt"].lower()
-    assert "memory.manage" in prompt
-    assert "explicit owner confirmation" in prompt
-    assert "never use a direct memory tool" in prompt
-    assert "skill creation and edits are live here via the direct skills tools" in prompt
+
+
+@pytest.mark.parametrize(
+    ("skill_name", "content"),
+    [
+        ("hermes-agent", "Mein Memory-Canary lautet HERMES-M6A-20260719-A."),
+        (
+            "research-paper-writing",
+            "Mein Research-Memory-Canary lautet HERMES-M6A-20260719-B.",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_trusted_surface_explicit_memory_command_is_normalized_without_model_tools(
+    trusted_surface_adapter,
+    session_db,
+    skill_name,
+    content,
+):
+    session_id = session_db.create_session(
+        f"trusted-memory-deterministic-{skill_name}",
+        "trusted_surface",
+        user_id="user:owner1",
+        model="test-model",
+    )
+    user_message = f"Merke dir mit {skill_name} dauerhaft: {content}"
+    mock_run = AsyncMock(
+        return_value=(
+            {
+                "final_response": (
+                    "Anweisung notiert und Auftrag in Aufgabenliste übernommen."
+                ),
+                "session_id": session_id,
+            },
+            {"total_tokens": 5},
+        )
+    )
+    app = _create_session_app(trusted_surface_adapter)
+    with patch.object(trusted_surface_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/trusted-surface/sessions/{session_id}/chat",
+                json={"message": user_message},
+                headers={
+                    "Authorization": (
+                        "Bearer "
+                        + _trusted_surface_token(
+                            allowed_toolsets=["kanban", "skills"]
+                        )
+                    )
+                },
+            )
+            assert resp.status == 200
+            payload = await resp.json()
+
+    mock_run.assert_not_awaited()
+    assert payload["message"]["content"] == (
+        "Ich bereite die Memory-Aktion zur Bestätigung vor."
+    )
+    assert payload["usage"] == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    assert len(payload["action_intent"]) == 1
+    intent = payload["action_intent"][0]
+    assert intent["type"] == "jarvis.action.intent"
+    assert intent["intent_id"].startswith("memory-add-")
+    assert len(intent["intent_id"]) <= 64
+    assert intent["action"] == "memory.manage"
+    assert intent["params"] == {
+        "skill_name": skill_name,
+        "operation": "add",
+        "target": "memory",
+        "content": content,
+    }
+    assert intent["provenance"] == {
+        "skill_name": "owner_spoken",
+        "operation": "owner_spoken",
+        "target": "owner_spoken",
+        "content": "owner_spoken",
+    }
+    messages = session_db.get_messages(session_id)
+    assert [(message["role"], message["content"]) for message in messages] == [
+        ("user", user_message),
+        (
+            "assistant",
+            "Ich bereite die Memory-Aktion zur Bestätigung vor.",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_trusted_surface_identical_memory_add_is_idempotent_per_session(
+    trusted_surface_adapter,
+    session_db,
+):
+    first_session = session_db.create_session(
+        "trusted-memory-idempotent-a",
+        "trusted_surface",
+        user_id="user:owner1",
+        model="test-model",
+    )
+    second_session = session_db.create_session(
+        "trusted-memory-idempotent-b",
+        "trusted_surface",
+        user_id="user:owner1",
+        model="test-model",
+    )
+    message = (
+        "Merke dir mit hermes-agent dauerhaft: "
+        "Mein Memory-Canary lautet HERMES-M6A-IDEMPOTENT."
+    )
+    mock_run = AsyncMock()
+    app = _create_session_app(trusted_surface_adapter)
+    with patch.object(trusted_surface_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                f"/api/trusted-surface/sessions/{first_session}/chat",
+                json={"message": message},
+                headers={"Authorization": f"Bearer {_trusted_surface_token()}"},
+            )
+            retry = await cli.post(
+                f"/api/trusted-surface/sessions/{first_session}/chat",
+                json={"message": message},
+                headers={"Authorization": f"Bearer {_trusted_surface_token()}"},
+            )
+            separate_session = await cli.post(
+                f"/api/trusted-surface/sessions/{second_session}/chat",
+                json={"message": message},
+                headers={"Authorization": f"Bearer {_trusted_surface_token()}"},
+            )
+            assert first.status == retry.status == separate_session.status == 200
+            first_payload = await first.json()
+            retry_payload = await retry.json()
+            separate_payload = await separate_session.json()
+
+    mock_run.assert_not_awaited()
+    first_id = first_payload["action_intent"][0]["intent_id"]
+    assert retry_payload["action_intent"][0]["intent_id"] == first_id
+    assert separate_payload["action_intent"][0]["intent_id"] != first_id
+
+
+@pytest.mark.asyncio
+async def test_trusted_surface_memory_turn_does_not_leave_partial_transcript(
+    trusted_surface_adapter,
+    session_db,
+    monkeypatch,
+):
+    session_id = session_db.create_session(
+        "trusted-memory-atomic-failure",
+        "trusted_surface",
+        user_id="user:owner1",
+        model="test-model",
+    )
+    real_insert = session_db._insert_message_rows
+
+    def fail_after_first_row(conn, stored_session_id, messages):
+        real_insert(conn, stored_session_id, messages[:1])
+        raise RuntimeError("injected paired-turn failure")
+
+    monkeypatch.setattr(
+        session_db,
+        "_insert_message_rows",
+        fail_after_first_row,
+    )
+    mock_run = AsyncMock()
+    app = _create_session_app(trusted_surface_adapter)
+    with patch.object(trusted_surface_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/trusted-surface/sessions/{session_id}/chat",
+                json={
+                    "message": (
+                        "Merke dir mit hermes-agent dauerhaft: "
+                        "Dieser Turn muss atomar bleiben."
+                    )
+                },
+                headers={"Authorization": f"Bearer {_trusted_surface_token()}"},
+            )
+            assert resp.status == 503
+            payload = await resp.json()
+
+    mock_run.assert_not_awaited()
+    assert payload["error"]["code"] == (
+        "trusted_surface_memory_turn_persist_failed"
+    )
+    assert session_db.get_messages(session_id) == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Merke dir mit unknown-skill dauerhaft: Inhalt.",
+        "Merke dir mit hermes-agent dauerhaft:",
+        "Merke dir mit hermes-agent dauerhaft: " + ("x" * 2201),
+        "Merke dir mit hermes-agent dauerhaft: vor\u0001nach",
+    ],
+)
+@pytest.mark.asyncio
+async def test_trusted_surface_invalid_closed_memory_add_fails_without_model_tools(
+    trusted_surface_adapter,
+    session_db,
+    message,
+):
+    session_id = session_db.create_session(
+        f"trusted-memory-invalid-{len(message)}",
+        "trusted_surface",
+        user_id="user:owner1",
+        model="test-model",
+    )
+    mock_run = AsyncMock()
+    app = _create_session_app(trusted_surface_adapter)
+    with patch.object(trusted_surface_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/trusted-surface/sessions/{session_id}/chat",
+                json={"message": message},
+                headers={"Authorization": f"Bearer {_trusted_surface_token()}"},
+            )
+            assert resp.status == 200
+            payload = await resp.json()
+
+    mock_run.assert_not_awaited()
+    assert "action_intent" not in payload
+    assert payload["message"]["content"] == (
+        "Ich konnte keine bestätigbare Memory-Aktion vorbereiten. "
+        "Es wurde nichts dauerhaft gespeichert oder geändert."
+    )
+
+
+@pytest.mark.asyncio
+async def test_trusted_surface_memory_request_without_intent_cannot_claim_success(
+    trusted_surface_adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "trusted-memory-missing-intent",
+        "trusted_surface",
+        user_id="user:owner1",
+        model="test-model",
+    )
+    mock_run = AsyncMock(
+        return_value=(
+            {
+                "final_response": (
+                    "Anweisung notiert und Auftrag in Aufgabenliste übernommen."
+                ),
+                "session_id": session_id,
+            },
+            {"total_tokens": 5},
+        )
+    )
+    app = _create_session_app(trusted_surface_adapter)
+    with patch.object(trusted_surface_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/trusted-surface/sessions/{session_id}/chat",
+                json={
+                    "message": "Erinnere dich bitte an Martin."
+                },
+                headers={
+                    "Authorization": (
+                        "Bearer "
+                        + _trusted_surface_token(
+                            allowed_toolsets=["kanban", "skills"]
+                        )
+                    )
+                },
+            )
+            assert resp.status == 200
+            payload = await resp.json()
+
+    mock_run.assert_not_awaited()
+    assert "action_intent" not in payload
+    assert payload["message"]["content"] == (
+        "Ich konnte keine bestätigbare Memory-Aktion vorbereiten. "
+        "Es wurde nichts dauerhaft gespeichert oder geändert."
+    )
 
 
 @pytest.mark.asyncio
@@ -484,7 +757,11 @@ async def test_trusted_surface_memory_request_uses_confirmed_action_intent_not_d
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
                 f"/api/trusted-surface/sessions/{session_id}/chat",
-                json={"message": "Merke dir dauerhaft: Martin will am Donnerstag telefonieren."},
+                json={
+                    "message": (
+                        "Bereite eine dauerhafte Memory-Aktion für Martin vor."
+                    )
+                },
                 headers={"Authorization": f"Bearer {_trusted_surface_token(allowed_toolsets=[])}"},
             )
             assert resp.status == 200
@@ -499,9 +776,6 @@ async def test_trusted_surface_memory_request_uses_confirmed_action_intent_not_d
     assert kwargs["enabled_toolsets_override"] == []
     assert kwargs["vault_tenant_id"] is None
     assert kwargs["vault_owner_id"] is None
-    prompt = kwargs["ephemeral_system_prompt"].lower()
-    assert "memory.manage" in prompt
-    assert "never use a direct memory tool" in prompt
 
 
 @pytest.mark.asyncio

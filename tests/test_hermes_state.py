@@ -663,6 +663,58 @@ class TestMessageStorage:
         assert messages[0]["content"] == "Hello"
         assert messages[1]["role"] == "assistant"
 
+    def test_append_messages_atomic_commits_pair_and_counters(self, db):
+        db.create_session(session_id="s1", source="api_server")
+
+        inserted = db.append_messages_atomic(
+            "s1",
+            [
+                {"role": "user", "content": "Remember this."},
+                {"role": "assistant", "content": "Confirmation required."},
+            ],
+        )
+
+        assert inserted == 2
+        assert [
+            (message["role"], message["content"])
+            for message in db.get_messages("s1")
+        ] == [
+            ("user", "Remember this."),
+            ("assistant", "Confirmation required."),
+        ]
+        session = db.get_session("s1")
+        assert session["message_count"] == 2
+        assert session["tool_call_count"] == 0
+
+    def test_append_messages_atomic_rolls_back_partial_insert(
+        self, db, monkeypatch
+    ):
+        db.create_session(session_id="s1", source="api_server")
+        real_insert = db._insert_message_rows
+
+        def fail_after_first_row(conn, session_id, messages):
+            real_insert(conn, session_id, messages[:1])
+            raise sqlite3.OperationalError("injected second-row failure")
+
+        monkeypatch.setattr(db, "_insert_message_rows", fail_after_first_row)
+
+        with pytest.raises(
+            sqlite3.OperationalError,
+            match="injected second-row failure",
+        ):
+            db.append_messages_atomic(
+                "s1",
+                [
+                    {"role": "user", "content": "Remember this."},
+                    {"role": "assistant", "content": "Confirmation required."},
+                ],
+            )
+
+        assert db.get_messages("s1") == []
+        session = db.get_session("s1")
+        assert session["message_count"] == 0
+        assert session["tool_call_count"] == 0
+
     def test_append_message_sets_active_for_transcript_loader(self, db):
         """Regression #51646: gateway loaders filter on active = 1."""
         db.create_session(session_id="s1", source="discord")

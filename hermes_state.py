@@ -3594,6 +3594,43 @@ class SessionDB:
             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
         return inserted, tool_calls_total
 
+    def append_messages_atomic(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> int:
+        """Append a non-empty message batch in one SQLite transaction.
+
+        This is the paired-turn counterpart to :meth:`append_message`.
+        Callers that synthesize both sides of a turn must not risk persisting a
+        lone user row when the assistant-row insert fails, because that breaks
+        transcript role alternation on the next turn.
+        """
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages must be a non-empty list")
+        batch: List[Dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError("each message must be a mapping")
+            batch.append(dict(message))
+
+        def _do(conn):
+            inserted, tool_calls = self._insert_message_rows(
+                conn,
+                session_id,
+                batch,
+            )
+            conn.execute(
+                """UPDATE sessions
+                   SET message_count = message_count + ?,
+                       tool_call_count = tool_call_count + ?
+                   WHERE id = ?""",
+                (inserted, tool_calls, session_id),
+            )
+            return inserted
+
+        return self._execute_write(_do)
+
     def replace_messages(
         self,
         session_id: str,
