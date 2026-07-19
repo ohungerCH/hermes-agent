@@ -36,6 +36,64 @@ def test_disabled_by_default_and_no_runtime_is_created() -> None:
     assert adapter._jarvis_memory_executor is None
 
 
+def test_closed_deployment_env_configures_executor_without_volume_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_MEMORY_EXECUTOR_ENABLED", "true")
+    monkeypatch.setenv(
+        "JARVIS_MEMORY_EXECUTOR_SOCKET_PATH",
+        str(tmp_path / "run" / "memory.sock"),
+    )
+    monkeypatch.setenv(
+        "JARVIS_MEMORY_EXECUTOR_JOURNAL_PATH",
+        str(tmp_path / "state" / "memory-executor.sqlite3"),
+    )
+    monkeypatch.setenv("JARVIS_MEMORY_EXECUTOR_ALLOWED_PEER_UID", "10027")
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+
+    assert adapter._jarvis_memory_executor_config == {
+        "socket_path": tmp_path / "run" / "memory.sock",
+        "journal_path":
+            tmp_path / "state" / "memory-executor.sqlite3",
+        "allowed_peer_uid": 10027,
+    }
+
+
+@pytest.mark.parametrize(
+    "environment",
+    (
+        {"JARVIS_MEMORY_EXECUTOR_ENABLED": "yes"},
+        {"JARVIS_MEMORY_EXECUTOR_ENABLED": "true"},
+        {
+            "JARVIS_MEMORY_EXECUTOR_ENABLED": "true",
+            "JARVIS_MEMORY_EXECUTOR_SOCKET_PATH": "/run/memory.sock",
+            "JARVIS_MEMORY_EXECUTOR_JOURNAL_PATH": "/state/memory.sqlite3",
+            "JARVIS_MEMORY_EXECUTOR_ALLOWED_PEER_UID": "root",
+        },
+        {
+            "JARVIS_MEMORY_EXECUTOR_ENABLED": "true",
+            "JARVIS_MEMORY_EXECUTOR_SOCKET_PATH": "memory.sock",
+            "JARVIS_MEMORY_EXECUTOR_JOURNAL_PATH": "/state/memory.sqlite3",
+            "JARVIS_MEMORY_EXECUTOR_ALLOWED_PEER_UID": "10027",
+        },
+    ),
+)
+def test_open_or_partial_deployment_env_is_rejected(
+    environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+
+    with pytest.raises(
+        ValueError,
+        match="jarvis_memory_executor_config_invalid",
+    ):
+        APIServerAdapter(PlatformConfig(enabled=True))
+
+
 def test_explicit_closed_config_starts_and_stops_owned_server(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

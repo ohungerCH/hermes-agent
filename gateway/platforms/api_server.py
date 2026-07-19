@@ -1250,7 +1250,42 @@ class APIServerAdapter(BasePlatformAdapter):
     ) -> Optional[Dict[str, Any]]:
         """Parse only the deployment-owned, closed local UDS configuration."""
         if raw is None:
-            return None
+            enabled_name = "JARVIS_MEMORY_EXECUTOR_ENABLED"
+            socket_name = "JARVIS_MEMORY_EXECUTOR_SOCKET_PATH"
+            journal_name = "JARVIS_MEMORY_EXECUTOR_JOURNAL_PATH"
+            peer_name = "JARVIS_MEMORY_EXECUTOR_ALLOWED_PEER_UID"
+            enabled = os.getenv(enabled_name)
+            configured = any(
+                os.getenv(name) is not None
+                for name in (socket_name, journal_name, peer_name)
+            )
+            if enabled is None:
+                if configured:
+                    raise ValueError(
+                        "jarvis_memory_executor_config_invalid"
+                    )
+                return None
+            if enabled not in {"true", "false"}:
+                raise ValueError(
+                    "jarvis_memory_executor_config_invalid"
+                )
+            if enabled == "false":
+                return None
+            peer_raw = os.getenv(peer_name)
+            if (
+                peer_raw is None
+                or not peer_raw.isdecimal()
+                or len(peer_raw) > 10
+            ):
+                raise ValueError(
+                    "jarvis_memory_executor_config_invalid"
+                )
+            raw = {
+                "enabled": True,
+                "socket_path": os.getenv(socket_name),
+                "journal_path": os.getenv(journal_name),
+                "allowed_peer_uid": int(peer_raw),
+            }
         if type(raw) is not dict or type(raw.get("enabled")) is not bool:
             raise ValueError("jarvis_memory_executor_config_invalid")
         if raw["enabled"] is False:
