@@ -1187,6 +1187,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
         )
+        self._jarvis_memory_executor_config = (
+            self._parse_jarvis_memory_executor_config(
+                extra.get("jarvis_memory_executor")
+            )
+        )
+        self._jarvis_memory_executor: Optional[Any] = None
         self._trusted_surface_seam = TrustedSurfaceAdapterSeam(
             TrustedSurfaceConfig.from_sources(
                 extra.get("trusted_surface"),
@@ -1237,6 +1243,73 @@ class APIServerAdapter(BasePlatformAdapter):
         # Number of in-flight runs on the non-streaming chat/responses paths
         # (the /v1/runs path tracks its own in-flight set via _run_streams).
         self._inflight_agent_runs: int = 0
+
+    @staticmethod
+    def _parse_jarvis_memory_executor_config(
+        raw: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Parse only the deployment-owned, closed local UDS configuration."""
+        if raw is None:
+            return None
+        if type(raw) is not dict or type(raw.get("enabled")) is not bool:
+            raise ValueError("jarvis_memory_executor_config_invalid")
+        if raw["enabled"] is False:
+            if frozenset(raw) != {"enabled"}:
+                raise ValueError("jarvis_memory_executor_config_invalid")
+            return None
+        expected = frozenset({
+            "enabled",
+            "socket_path",
+            "journal_path",
+            "allowed_peer_uid",
+        })
+        socket_path = Path(str(raw.get("socket_path", "")))
+        journal_path = Path(str(raw.get("journal_path", "")))
+        peer_uid = raw.get("allowed_peer_uid")
+        if (
+            frozenset(raw) != expected
+            or type(raw.get("socket_path")) is not str
+            or not socket_path.is_absolute()
+            or type(raw.get("journal_path")) is not str
+            or not journal_path.is_absolute()
+            or type(peer_uid) is not int
+            or peer_uid < 0
+        ):
+            raise ValueError("jarvis_memory_executor_config_invalid")
+        return {
+            "socket_path": socket_path,
+            "journal_path": journal_path,
+            "allowed_peer_uid": peer_uid,
+        }
+
+    def _start_jarvis_memory_executor(self) -> None:
+        if self._jarvis_memory_executor_config is None:
+            return
+        if self._jarvis_memory_executor is not None:
+            raise ValueError("jarvis_memory_executor_already_running")
+        from tools.authorized_memory_executor_server import (
+            AuthorizedMemoryExecutorUnixServer,
+        )
+
+        server = AuthorizedMemoryExecutorUnixServer(
+            **self._jarvis_memory_executor_config
+        )
+        server.start()
+        self._jarvis_memory_executor = server
+
+    def _stop_jarvis_memory_executor(self) -> None:
+        server = self._jarvis_memory_executor
+        self._jarvis_memory_executor = None
+        if server is not None:
+            server.stop()
+
+    def _jarvis_memory_executor_status(self) -> Dict[str, Any]:
+        server = self._jarvis_memory_executor
+        if self._jarvis_memory_executor_config is None:
+            return {"enabled": False, "running": False}
+        if server is None:
+            return {"enabled": True, "running": False}
+        return dict(server.status())
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1758,6 +1831,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "exit_reason": runtime.get("exit_reason"),
             "updated_at": runtime.get("updated_at"),
             "pid": os.getpid(),
+            "jarvis_memory_executor":
+                self._jarvis_memory_executor_status(),
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
@@ -5674,6 +5749,7 @@ class APIServerAdapter(BasePlatformAdapter):
             await self._runner.setup()
             self._site = web.TCPSite(self._runner, self._host, self._port)
             await self._site.start()
+            self._start_jarvis_memory_executor()
 
             self._mark_connected()
             logger.info(
@@ -5683,6 +5759,20 @@ class APIServerAdapter(BasePlatformAdapter):
             return True
 
         except Exception as e:
+            self._stop_jarvis_memory_executor()
+            if self._site:
+                try:
+                    await self._site.stop()
+                except Exception:
+                    pass
+                self._site = None
+            if self._runner:
+                try:
+                    await self._runner.cleanup()
+                except Exception:
+                    pass
+                self._runner = None
+            self._app = None
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
 
@@ -5699,6 +5789,7 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
+        self._stop_jarvis_memory_executor()
         if self._response_store is not None:
             try:
                 self._response_store.close()

@@ -17,6 +17,7 @@ import pytest
 from tools.authorized_memory_executor_server import (
     AuthorizedMemoryExecutor,
     AuthorizedMemoryExecutorError,
+    AuthorizedMemoryExecutorUnixServer,
     SqliteAuthorizedMemoryExecutionStore,
     canonical_json_bytes,
     serve_memory_executor_connection,
@@ -42,10 +43,9 @@ def _request(**changes):
     }
     value = {
         "schema_version": "jarvis.memory_executor.request.v1",
+        "effect_permit_hash": "sha256-v1:" + "2" * 64,
         "execution_claim_id": "m6a.memory.executor-claim.123",
         "execution_claim_hash": "sha256-v1:" + "1" * 64,
-        "execution_package_hash": "sha256-v1:" + "2" * 64,
-        "materializer_resume_hash": "sha256-v1:" + "3" * 64,
         "idempotency_key": "m6a.memory.idempotency.123",
         "expires_at": (NOW + timedelta(seconds=30)).isoformat(),
         "request_id": "request.memory.123",
@@ -57,7 +57,6 @@ def _request(**changes):
         "skill_id": "skill.hermes-agent",
         "capability_id": "tool.memory",
         "action_id": "invoke",
-        "reserved_spool_sequence": 25,
         "params_hash": _sha256({
             "action": "invoke",
             "params": params,
@@ -218,6 +217,41 @@ def test_journal_is_private_and_detects_response_corruption(
         SqliteAuthorizedMemoryExecutionStore(path)
 
 
+def test_pre_permit_journal_schema_is_rejected_fail_closed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "memory-executor.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE memory_executor_meta_v1 (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        ) WITHOUT ROWID;
+        CREATE TABLE memory_executor_runs_v1 (
+            idempotency_key TEXT PRIMARY KEY,
+            request_hash TEXT UNIQUE NOT NULL,
+            execution_claim_id TEXT UNIQUE NOT NULL,
+            execution_claim_hash TEXT UNIQUE NOT NULL,
+            state TEXT NOT NULL,
+            response_json TEXT,
+            response_hash TEXT
+        ) WITHOUT ROWID;
+        INSERT INTO memory_executor_meta_v1(key,value)
+        VALUES('schema_version','1');
+        """
+    )
+    connection.commit()
+    connection.close()
+    path.chmod(0o600)
+
+    with pytest.raises(
+        AuthorizedMemoryExecutorError,
+        match="memory_executor_store_schema_invalid",
+    ):
+        SqliteAuthorizedMemoryExecutionStore(path)
+
+
 def test_idempotency_collision_and_started_run_fail_closed(
     memory_store: MemoryStore,
     journal: SqliteAuthorizedMemoryExecutionStore,
@@ -239,6 +273,7 @@ def test_idempotency_collision_and_started_run_fail_closed(
     pending = _request(
         execution_claim_id="m6a.memory.executor-claim.pending",
         execution_claim_hash="sha256-v1:" + "4" * 64,
+        effect_permit_hash="sha256-v1:" + "5" * 64,
         idempotency_key="m6a.memory.idempotency.pending",
         request_id="request.memory.pending",
     )
@@ -264,7 +299,9 @@ def test_idempotency_collision_and_started_run_fail_closed(
         lambda value: value.update(product_action_id="terminal.run"),
         lambda value: value.update(capability_id="tool.terminal"),
         lambda value: value.update(action_id="write"),
-        lambda value: value.update(reserved_spool_sequence=True),
+        lambda value: value.update(
+            effect_permit_hash="sha256-v1:" + "z" * 64
+        ),
         lambda value: value.update(params_hash="sha256-v1:" + "f" * 64),
         lambda value: value.update(expires_at=NOW.isoformat()),
         lambda value: value["params"].update(path="/root/.hermes"),
@@ -423,3 +460,79 @@ def test_socket_oversize_and_trailing_frame_never_execute(
 
     assert journal.count() == 0
     assert memory_store.memory_entries == []
+
+
+def test_unix_server_lifecycle_creates_private_runtime_and_executes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    socket_path = tmp_path / "run" / "memory.sock"
+    journal_path = tmp_path / "state" / "memory-executor.sqlite3"
+    server = AuthorizedMemoryExecutorUnixServer(
+        socket_path=socket_path,
+        journal_path=journal_path,
+        allowed_peer_uid=os.getuid(),
+        clock=lambda: NOW,
+    )
+
+    server.start()
+    try:
+        assert stat.S_ISSOCK(socket_path.lstat().st_mode)
+        assert stat.S_IMODE(socket_path.lstat().st_mode) == 0o660
+        assert socket_path.lstat().st_uid == os.getuid()
+        assert stat.S_IMODE(journal_path.stat().st_mode) == 0o600
+        assert server.status() == {
+            "enabled": True,
+            "running": True,
+            "socket_path": str(socket_path),
+        }
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(2)
+            client.connect(str(socket_path))
+            client.sendall(canonical_json_bytes(_request()) + b"\n")
+            client.shutdown(socket.SHUT_WR)
+            response = json.loads(client.makefile("rb").read())
+        assert response["status"] == "executed"
+    finally:
+        server.stop()
+
+    assert not socket_path.exists()
+    assert server.status()["running"] is False
+
+
+@pytest.mark.parametrize("kind", ("regular", "symlink", "live_socket"))
+def test_unix_server_never_replaces_an_unsafe_or_live_path(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    socket_path = tmp_path / "memory.sock"
+    listener = None
+    if kind == "regular":
+        socket_path.write_text("keep", encoding="utf-8")
+    elif kind == "symlink":
+        target = tmp_path / "target"
+        target.write_text("keep", encoding="utf-8")
+        socket_path.symlink_to(target)
+    else:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        listener.listen(1)
+    server = AuthorizedMemoryExecutorUnixServer(
+        socket_path=socket_path,
+        journal_path=tmp_path / "memory-executor.sqlite3",
+        allowed_peer_uid=os.getuid(),
+        clock=lambda: NOW,
+    )
+
+    try:
+        with pytest.raises(
+            AuthorizedMemoryExecutorError,
+            match="memory_executor_socket_path_busy",
+        ):
+            server.start()
+        assert socket_path.exists() or socket_path.is_symlink()
+    finally:
+        if listener is not None:
+            listener.close()

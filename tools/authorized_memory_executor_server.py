@@ -2,8 +2,8 @@
 
 Das Modul ist kein Model-Tool und besitzt keine M6a-Schluessel. Authority
 kommt ausschliesslich vom per ``SO_PEERCRED`` gebundenen Gate-Prozess. Der
-Request bleibt trotzdem geschlossen und an Claim, Resume, Params sowie den
-reservierten Spool-Slot gebunden.
+Request bleibt trotzdem geschlossen und an den verifizierten Effect-Permit,
+Execution-Claim, Scope, Ablauf und die exakten Params gebunden.
 """
 
 from __future__ import annotations
@@ -31,10 +31,9 @@ from tools.memory_tool import MemoryStore, load_on_disk_store
 
 _REQUEST_KEYS = frozenset({
     "schema_version",
+    "effect_permit_hash",
     "execution_claim_id",
     "execution_claim_hash",
-    "execution_package_hash",
-    "materializer_resume_hash",
     "idempotency_key",
     "expires_at",
     "request_id",
@@ -46,7 +45,6 @@ _REQUEST_KEYS = frozenset({
     "skill_id",
     "capability_id",
     "action_id",
-    "reserved_spool_sequence",
     "params_hash",
     "params",
 })
@@ -54,12 +52,10 @@ _RESPONSE_KEYS = frozenset({
     "schema_version",
     "status",
     "request_hash",
+    "effect_permit_hash",
     "execution_claim_id",
     "execution_claim_hash",
-    "execution_package_hash",
-    "materializer_resume_hash",
     "idempotency_key",
-    "reserved_spool_sequence",
     "result",
 })
 _RESULT_COMMON_KEYS = frozenset({
@@ -86,7 +82,7 @@ _MAX_REQUEST_BYTES = 36_864
 _MAX_RESPONSE_BYTES = 40_960
 _MAX_EXPIRY_SECONDS = 120
 _BUSY_TIMEOUT_MS = 5000
-_SCHEMA_VERSION = "1"
+_SCHEMA_VERSION = "2"
 
 
 class AuthorizedMemoryExecutorError(ValueError):
@@ -163,12 +159,14 @@ def _parse_request(raw: Any, *, now: datetime) -> Dict[str, Any]:
         or raw["capability_id"] != "tool.memory"
         or raw["action_id"] != "invoke"
         or skill_id != f"skill.{parsed_params['skill_name']}"
-        or type(raw["reserved_spool_sequence"]) is not int
-        or raw["reserved_spool_sequence"] < 1
     ):
         _fail("memory_executor_scope_invalid")
     result: Dict[str, Any] = {
         "schema_version": "jarvis.memory_executor.request.v1",
+        "effect_permit_hash": _hash(
+            raw["effect_permit_hash"],
+            "effect_permit_hash",
+        ),
         "execution_claim_id": _identifier(
             raw["execution_claim_id"],
             "execution_claim_id",
@@ -176,14 +174,6 @@ def _parse_request(raw: Any, *, now: datetime) -> Dict[str, Any]:
         "execution_claim_hash": _hash(
             raw["execution_claim_hash"],
             "execution_claim_hash",
-        ),
-        "execution_package_hash": _hash(
-            raw["execution_package_hash"],
-            "execution_package_hash",
-        ),
-        "materializer_resume_hash": _hash(
-            raw["materializer_resume_hash"],
-            "materializer_resume_hash",
         ),
         "idempotency_key": _identifier(
             raw["idempotency_key"],
@@ -205,7 +195,6 @@ def _parse_request(raw: Any, *, now: datetime) -> Dict[str, Any]:
         "skill_id": skill_id,
         "capability_id": "tool.memory",
         "action_id": "invoke",
-        "reserved_spool_sequence": raw["reserved_spool_sequence"],
         "params_hash": _hash(raw["params_hash"], "params_hash"),
         "params": parsed_params,
     }
@@ -293,15 +282,12 @@ def _validate_response(value: Any) -> Dict[str, Any]:
         or value.get("schema_version")
         != "jarvis.memory_executor.response.v1"
         or value.get("status") != "executed"
-        or type(value.get("reserved_spool_sequence")) is not int
-        or value["reserved_spool_sequence"] < 1
     ):
         _fail("memory_executor_response_invalid")
     for field in (
         "request_hash",
+        "effect_permit_hash",
         "execution_claim_hash",
-        "execution_package_hash",
-        "materializer_resume_hash",
     ):
         _hash(value[field], field)
     for field in ("execution_claim_id", "idempotency_key"):
@@ -385,6 +371,7 @@ class SqliteAuthorizedMemoryExecutionStore:
                 CREATE TABLE IF NOT EXISTS memory_executor_runs_v1 (
                     idempotency_key TEXT PRIMARY KEY,
                     request_hash TEXT UNIQUE NOT NULL,
+                    effect_permit_hash TEXT UNIQUE NOT NULL,
                     execution_claim_id TEXT UNIQUE NOT NULL,
                     execution_claim_hash TEXT UNIQUE NOT NULL,
                     state TEXT NOT NULL CHECK(state IN ('started','completed')),
@@ -425,6 +412,7 @@ class SqliteAuthorizedMemoryExecutionStore:
     def _validate_row(row: sqlite3.Row) -> Optional[Dict[str, Any]]:
         _identifier(row["idempotency_key"], "idempotency_key")
         _hash(row["request_hash"], "request_hash")
+        _hash(row["effect_permit_hash"], "effect_permit_hash")
         _identifier(row["execution_claim_id"], "execution_claim_id")
         _hash(row["execution_claim_hash"], "execution_claim_hash")
         if row["state"] == "started":
@@ -449,6 +437,8 @@ class SqliteAuthorizedMemoryExecutionStore:
             or response.get("request_hash") != row["request_hash"]
             or response.get("idempotency_key")
             != row["idempotency_key"]
+            or response.get("effect_permit_hash")
+            != row["effect_permit_hash"]
             or response.get("execution_claim_id")
             != row["execution_claim_id"]
             or response.get("execution_claim_hash")
@@ -465,10 +455,12 @@ class SqliteAuthorizedMemoryExecutionStore:
         row = self._db.execute(
             "SELECT * FROM memory_executor_runs_v1 "
             "WHERE idempotency_key=? OR request_hash=? "
-            "OR execution_claim_id=? OR execution_claim_hash=?",
+            "OR effect_permit_hash=? OR execution_claim_id=? "
+            "OR execution_claim_hash=?",
             (
                 request["idempotency_key"],
                 request_hash,
+                request["effect_permit_hash"],
                 request["execution_claim_id"],
                 request["execution_claim_hash"],
             ),
@@ -476,6 +468,8 @@ class SqliteAuthorizedMemoryExecutionStore:
         if row is not None and (
             row["idempotency_key"] != request["idempotency_key"]
             or row["request_hash"] != request_hash
+            or row["effect_permit_hash"]
+            != request["effect_permit_hash"]
             or row["execution_claim_id"] != request["execution_claim_id"]
             or row["execution_claim_hash"]
             != request["execution_claim_hash"]
@@ -495,12 +489,13 @@ class SqliteAuthorizedMemoryExecutionStore:
                 if row is None:
                     self._db.execute(
                         "INSERT INTO memory_executor_runs_v1("
-                        "idempotency_key,request_hash,execution_claim_id,"
-                        "execution_claim_hash,state"
-                        ") VALUES(?,?,?,?, 'started')",
+                        "idempotency_key,request_hash,effect_permit_hash,"
+                        "execution_claim_id,execution_claim_hash,state"
+                        ") VALUES(?,?,?,?,?, 'started')",
                         (
                             request["idempotency_key"],
                             request_hash,
+                            request["effect_permit_hash"],
                             request["execution_claim_id"],
                             request["execution_claim_hash"],
                         ),
@@ -658,14 +653,10 @@ class AuthorizedMemoryExecutor:
             "schema_version": "jarvis.memory_executor.response.v1",
             "status": "executed",
             "request_hash": request_hash,
+            "effect_permit_hash": request["effect_permit_hash"],
             "execution_claim_id": request["execution_claim_id"],
             "execution_claim_hash": request["execution_claim_hash"],
-            "execution_package_hash": request["execution_package_hash"],
-            "materializer_resume_hash":
-                request["materializer_resume_hash"],
             "idempotency_key": request["idempotency_key"],
-            "reserved_spool_sequence":
-                request["reserved_spool_sequence"],
             "result": _validate_result(result),
         }
         self._journal.finish(request, request_hash, response)
@@ -757,9 +748,201 @@ def serve_memory_executor_connection(
             pass
 
 
+class AuthorizedMemoryExecutorUnixServer:
+    """Kleiner API-prozesseigener Listener fuer den lokalen Gate-Peer."""
+
+    def __init__(
+        self,
+        *,
+        socket_path: Path,
+        journal_path: Path,
+        allowed_peer_uid: int,
+        clock: Callable[[], datetime] = lambda: datetime.now().astimezone(),
+    ) -> None:
+        if (
+            not isinstance(socket_path, Path)
+            or not socket_path.is_absolute()
+            or len(str(socket_path).encode("utf-8")) > 100
+            or not isinstance(journal_path, Path)
+            or not journal_path.is_absolute()
+            or socket_path == journal_path
+            or type(allowed_peer_uid) is not int
+            or allowed_peer_uid < 0
+            or not callable(clock)
+        ):
+            _fail("memory_executor_server_config_invalid")
+        self._socket_path = socket_path
+        self._journal_path = journal_path
+        self._allowed_peer_uid = allowed_peer_uid
+        self._clock = clock
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._listener: Optional[socket.socket] = None
+        self._journal: Optional[
+            SqliteAuthorizedMemoryExecutionStore
+        ] = None
+        self._executor: Optional[AuthorizedMemoryExecutor] = None
+        self._thread: Optional[threading.Thread] = None
+        self._socket_identity: Optional[tuple[int, int]] = None
+
+    def _prepare_socket_path(self) -> None:
+        parent = self._socket_path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        if parent.is_symlink() or not parent.is_dir():
+            _fail("memory_executor_socket_path_busy")
+        try:
+            metadata = self._socket_path.lstat()
+        except FileNotFoundError:
+            return
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISSOCK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            _fail("memory_executor_socket_path_busy")
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.1)
+            probe.connect(str(self._socket_path))
+        except (ConnectionRefusedError, FileNotFoundError):
+            self._socket_path.unlink()
+            return
+        except OSError:
+            _fail("memory_executor_socket_path_busy")
+        finally:
+            probe.close()
+        _fail("memory_executor_socket_path_busy")
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            listener = self._listener
+            executor = self._executor
+            if listener is None or executor is None:
+                return
+            try:
+                connection, _address = listener.accept()
+                connection.settimeout(5)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._stop.is_set():
+                    return
+                continue
+            serve_memory_executor_connection(
+                connection=connection,
+                allowed_peer_uid=self._allowed_peer_uid,
+                executor=executor,
+            )
+
+    def start(self) -> None:
+        with self._lock:
+            if self._listener is not None:
+                _fail("memory_executor_server_already_running")
+            self._prepare_socket_path()
+            journal: Optional[
+                SqliteAuthorizedMemoryExecutionStore
+            ] = None
+            listener: Optional[socket.socket] = None
+            try:
+                journal = SqliteAuthorizedMemoryExecutionStore(
+                    self._journal_path
+                )
+                executor = AuthorizedMemoryExecutor(
+                    journal,
+                    clock=self._clock,
+                )
+                listener = socket.socket(
+                    socket.AF_UNIX,
+                    socket.SOCK_STREAM,
+                )
+                listener.bind(str(self._socket_path))
+                os.chmod(self._socket_path, 0o660)
+                listener.listen(4)
+                listener.settimeout(0.2)
+                metadata = self._socket_path.lstat()
+                if (
+                    not stat.S_ISSOCK(metadata.st_mode)
+                    or metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(metadata.st_mode) != 0o660
+                ):
+                    _fail("memory_executor_socket_invalid")
+                self._socket_identity = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                )
+                self._stop.clear()
+                self._journal = journal
+                self._executor = executor
+                self._listener = listener
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="jarvis-memory-executor",
+                    daemon=True,
+                )
+                self._thread.start()
+            except Exception:
+                if listener is not None:
+                    listener.close()
+                if journal is not None:
+                    journal.close()
+                try:
+                    metadata = self._socket_path.lstat()
+                    if (
+                        stat.S_ISSOCK(metadata.st_mode)
+                        and metadata.st_uid == os.geteuid()
+                    ):
+                        self._socket_path.unlink()
+                except FileNotFoundError:
+                    pass
+                raise
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop.set()
+            listener = self._listener
+            thread = self._thread
+            journal = self._journal
+            identity = self._socket_identity
+            self._listener = None
+            self._thread = None
+            self._executor = None
+            self._journal = None
+            self._socket_identity = None
+            if listener is not None:
+                listener.close()
+        if thread is not None:
+            thread.join(timeout=2)
+        if journal is not None:
+            journal.close()
+        if identity is not None:
+            try:
+                metadata = self._socket_path.lstat()
+                if (
+                    stat.S_ISSOCK(metadata.st_mode)
+                    and (metadata.st_dev, metadata.st_ino) == identity
+                ):
+                    self._socket_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "enabled": True,
+                "running": (
+                    self._listener is not None
+                    and self._thread is not None
+                    and self._thread.is_alive()
+                ),
+                "socket_path": str(self._socket_path),
+            }
+
+
 __all__ = [
     "AuthorizedMemoryExecutor",
     "AuthorizedMemoryExecutorError",
+    "AuthorizedMemoryExecutorUnixServer",
     "SqliteAuthorizedMemoryExecutionStore",
     "canonical_json_bytes",
     "serve_memory_executor_connection",
