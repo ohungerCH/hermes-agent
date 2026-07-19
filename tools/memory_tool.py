@@ -536,6 +536,7 @@ class MemoryStore:
 
             # Work on a copy; only commit if the whole batch validates.
             working: List[str] = list(self._entries_for(target))
+            vault_changes: List[Dict[str, Optional[str]]] = []
             limit = self._char_limit(target)
 
             for i, op in enumerate(operations):
@@ -551,6 +552,11 @@ class MemoryStore:
                     if content in working:
                         continue  # idempotent -- skip duplicate, don't fail the batch
                     working.append(content)
+                    vault_changes.append({
+                        "action": "add",
+                        "content": content,
+                        "old_entry": None,
+                    })
 
                 elif act == "replace":
                     if not old_text:
@@ -568,7 +574,13 @@ class MemoryStore:
                             target,
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
+                    old_entry = working[matches[0]]
                     working[matches[0]] = content
+                    vault_changes.append({
+                        "action": "replace",
+                        "content": content,
+                        "old_entry": old_entry,
+                    })
 
                 elif act == "remove":
                     if not old_text:
@@ -581,7 +593,12 @@ class MemoryStore:
                             target,
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
-                    working.pop(matches[0])
+                    old_entry = working.pop(matches[0])
+                    vault_changes.append({
+                        "action": "remove",
+                        "content": None,
+                        "old_entry": old_entry,
+                    })
 
                 else:
                     return self._batch_error(
@@ -608,7 +625,12 @@ class MemoryStore:
             self._set_entries(target, working)
             self.save_to_disk(target)
 
-        return self._success_response(target, f"Applied {len(operations)} operation(s).")
+        result = self._success_response(
+            target,
+            f"Applied {len(operations)} operation(s).",
+        )
+        result["_vault_changes"] = vault_changes
+        return result
 
     def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
         """Build a batch-abort error that reports live (uncommitted) state."""
@@ -968,6 +990,33 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
     )
 
 
+def _shadow_batch_changes(result: Dict[str, Any], target: str) -> None:
+    """Pop internal batch change data and forward it to the Vault dark-wire."""
+
+    changes = (
+        result.pop("_vault_changes", [])
+        if isinstance(result, dict)
+        else []
+    )
+    if not isinstance(changes, list):
+        return
+    try:
+        from tools.vault.vault_wiring import vault_shadow_write
+
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            vault_shadow_write(
+                change.get("action"),
+                target,
+                change.get("content"),
+                store_result=result,
+                old_entry=change.get("old_entry"),
+            )
+    except Exception:
+        pass
+
+
 def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> str:
     """Build a recoverable error for a replace/remove call that arrived without
     ``old_text``.
@@ -1047,6 +1096,7 @@ def memory_tool(
         if gate_result is not None:
             return gate_result
         result = store.apply_batch(target, operations)
+        _shadow_batch_changes(result, target)
         return json.dumps(result, ensure_ascii=False)
 
     # --- Single-op path ---------------------------------------------------
@@ -1120,7 +1170,12 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
     if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [])
+        result = store.apply_batch(
+            target,
+            payload.get("operations") or [],
+        )
+        _shadow_batch_changes(result, target)
+        return result
     if action == "add":
         return store.add(target, content)
     if action == "replace":
@@ -1229,7 +1284,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

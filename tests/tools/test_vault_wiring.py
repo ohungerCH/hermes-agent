@@ -489,6 +489,46 @@ def test_memory_tool_hook_pops_vault_old_entry(monkeypatch):
     assert seen["result_has_key"] is False         # schon vor dem Hook-Call gepoppt
 
 
+def test_memory_tool_batch_shadows_each_change_without_leaking_internal_data(
+    monkeypatch,
+    tmp_path,
+):
+    """Batch-Writes behalten den Vault-Shadow und exponieren nie die Change-Naht."""
+    import tools.memory_tool as mt
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    store = mt.MemoryStore(memory_char_limit=500, user_char_limit=300)
+    store.load_from_disk()
+    store.add("memory", "Alter Eintrag")
+    seen = []
+
+    def _capture(action, target, content, *, store_result=None, old_entry=None):
+        seen.append((action, target, content, old_entry))
+        assert "_vault_changes" not in store_result
+
+    monkeypatch.setattr(
+        "tools.vault.vault_wiring.vault_shadow_write",
+        _capture,
+    )
+
+    out = mt.memory_tool(
+        target="memory",
+        operations=[
+            {"action": "remove", "old_text": "Alter"},
+            {"action": "add", "content": "Neuer Eintrag"},
+        ],
+        store=store,
+    )
+    body = json.loads(out)
+
+    assert body["success"] is True
+    assert "_vault_changes" not in body
+    assert seen == [
+        ("remove", "memory", None, "Alter Eintrag"),
+        ("add", "memory", "Neuer Eintrag", None),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # DLP-Redaktion owner_memory (Owner-Ratifikation 2026-07-11)
 # ---------------------------------------------------------------------------
