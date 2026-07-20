@@ -1,6 +1,6 @@
 """Focused tests for API server session-control endpoints."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import jwt
@@ -230,8 +230,8 @@ async def test_trusted_surface_chat_loads_history_and_uses_server_session_key(
     assert kwargs["session_id"] == session_id
     assert kwargs["gateway_session_key"].startswith("trusted_surface:")
     assert kwargs["enabled_toolsets_override"] == []
-    assert kwargs["vault_tenant_id"] is None
-    assert kwargs["vault_owner_id"] is None
+    assert kwargs["vault_tenant_id"] == "1a7530bd-3ae8-46b4-96a6-86a510debdab"
+    assert kwargs["vault_owner_id"] == "owner1"
     history = kwargs["conversation_history"]
     assert len(history) == 2
     assert history[0]["role"] == "user"
@@ -303,7 +303,7 @@ async def test_trusted_surface_chat_passes_direct_kanban_toolset_override(
 
 
 @pytest.mark.asyncio
-async def test_trusted_surface_unscoped_memory_add_is_rejected_without_model_tools(
+async def test_trusted_surface_memory_toolset_uses_direct_tool_and_disables_honesty_guard(
     trusted_surface_adapter,
     session_db,
 ):
@@ -316,16 +316,7 @@ async def test_trusted_surface_unscoped_memory_add_is_rejected_without_model_too
     mock_run = AsyncMock(
         return_value=(
             {
-                "final_response": (
-                    "Ich bereite die Erinnerung zur Bestätigung vor."
-                    "<<<JARVIS_ACTION_INTENT>>>"
-                    '{"type":"jarvis.action.intent","intent_id":"memory-add-1",'
-                    '"action":"memory.manage","params":{"skill_name":"hermes-agent",'
-                    '"operation":"add","target":"memory","content":'
-                    '"Martin will am Donnerstag telefonieren."},'
-                    '"provenance":{"content":"owner_spoken"}}'
-                    "<<<END_JARVIS_ACTION_INTENT>>>"
-                ),
+                "final_response": "Ich habe mir das gemerkt.",
                 "session_id": session_id,
             },
             {"total_tokens": 8},
@@ -349,12 +340,16 @@ async def test_trusted_surface_unscoped_memory_add_is_rejected_without_model_too
             assert resp.status == 200
             payload = await resp.json()
 
-    mock_run.assert_not_awaited()
+    mock_run.assert_awaited_once()
     assert "action_intent" not in payload
-    assert payload["message"]["content"] == (
-        "Ich konnte keine bestätigbare Memory-Aktion vorbereiten. "
-        "Es wurde nichts dauerhaft gespeichert oder geändert."
-    )
+    assert payload["message"]["content"] == "Ich habe mir das gemerkt."
+    _, kwargs = mock_run.call_args
+    assert kwargs["enabled_toolsets_override"] == ["kanban", "memory", "skills"]
+    assert kwargs["vault_tenant_id"] == "1a7530bd-3ae8-46b4-96a6-86a510debdab"
+    assert kwargs["vault_owner_id"] == "owner1"
+    prompt = kwargs["ephemeral_system_prompt"].lower()
+    assert "use the direct memory tool" in prompt
+    assert "confirmation card" not in prompt
 
 
 @pytest.mark.parametrize(
@@ -774,8 +769,8 @@ async def test_trusted_surface_memory_request_uses_confirmed_action_intent_not_d
     assert payload["action_intent"][0]["action"] == "memory.manage"
     _, kwargs = mock_run.call_args
     assert kwargs["enabled_toolsets_override"] == []
-    assert kwargs["vault_tenant_id"] is None
-    assert kwargs["vault_owner_id"] is None
+    assert kwargs["vault_tenant_id"] == "1a7530bd-3ae8-46b4-96a6-86a510debdab"
+    assert kwargs["vault_owner_id"] == "owner1"
 
 
 @pytest.mark.asyncio
@@ -856,6 +851,44 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         "context_session_key": "request-key",
         "child_session_id": "request-session",
     }
+
+
+@pytest.mark.asyncio
+async def test_run_agent_sets_nonempty_vault_write_identity(adapter):
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def run_conversation(self, user_message, conversation_history, task_id):
+            return {"final_response": "ok"}
+
+    adapter._create_agent = Mock(return_value=FakeAgent())
+    identity_token = object()
+    set_identity = Mock(return_value=identity_token)
+    reset_identity = Mock()
+
+    with (
+        patch(
+            "tools.vault.vault_wiring.set_vault_write_identity",
+            set_identity,
+        ),
+        patch(
+            "tools.vault.vault_wiring.reset_vault_write_identity",
+            reset_identity,
+        ),
+    ):
+        await adapter._run_agent(
+            user_message="remember this",
+            conversation_history=[],
+            session_id="owner-chat",
+            enabled_toolsets_override=["memory"],
+            vault_tenant_id="tenant-1",
+            vault_owner_id="owner-primary",
+        )
+
+    set_identity.assert_called_once_with("tenant-1", "owner-primary")
+    reset_identity.assert_called_once_with(identity_token)
 
 
 @pytest.mark.asyncio
@@ -1045,6 +1078,91 @@ async def test_session_chat_accepts_zero_toolset_override_only(
     _, kwargs = mock_run.call_args
     assert kwargs["enabled_toolsets_override"] == []
     assert payload["error"]["code"] == "enabled_toolsets_not_allowed"
+
+
+@pytest.mark.asyncio
+async def test_owner_chat_session_gets_server_memory_and_explicit_empty_override_wins(
+    auth_adapter, session_db, monkeypatch
+):
+    monkeypatch.setenv(
+        "JARVIS_VAULT_TENANT_ID",
+        "1a7530bd-3ae8-46b4-96a6-86a510debdab",
+    )
+    monkeypatch.setenv("JARVIS_VAULT_OWNER_ID", "owner-primary")
+
+    async def fake_run(**kwargs):
+        return (
+            {
+                "final_response": "safe answer",
+                "session_id": kwargs["session_id"],
+            },
+            {"total_tokens": 1},
+        )
+
+    mock_run = AsyncMock(side_effect=fake_run)
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            owner_create = await cli.post(
+                "/api/sessions",
+                json={"id": "owner-chat", "owner_chat": True},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert owner_create.status == 201, await owner_create.text()
+            plain_create = await cli.post(
+                "/api/sessions",
+                json={"id": "plain-chat"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert plain_create.status == 201, await plain_create.text()
+
+            owner = await cli.post(
+                "/api/sessions/owner-chat/chat",
+                json={"message": "remember this"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert owner.status == 200, await owner.text()
+            owner_kwargs = mock_run.await_args_list[-1].kwargs
+
+            narrowed = await cli.post(
+                "/api/sessions/owner-chat/chat",
+                json={"message": "read only", "enabled_toolsets": []},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert narrowed.status == 200, await narrowed.text()
+            narrowed_kwargs = mock_run.await_args_list[-1].kwargs
+
+            monkeypatch.delenv("JARVIS_VAULT_OWNER_ID")
+            missing_identity = await cli.post(
+                "/api/sessions/owner-chat/chat",
+                json={"message": "remember without complete server identity"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert missing_identity.status == 200, await missing_identity.text()
+            missing_identity_kwargs = mock_run.await_args_list[-1].kwargs
+
+            plain = await cli.post(
+                "/api/sessions/plain-chat/chat",
+                json={"message": "read only"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert plain.status == 200, await plain.text()
+            plain_kwargs = mock_run.await_args_list[-1].kwargs
+
+    assert owner_kwargs["enabled_toolsets_override"] == ["memory"]
+    assert owner_kwargs["vault_tenant_id"] == (
+        "1a7530bd-3ae8-46b4-96a6-86a510debdab"
+    )
+    assert owner_kwargs["vault_owner_id"] == "owner-primary"
+    assert narrowed_kwargs["enabled_toolsets_override"] == []
+    assert narrowed_kwargs["vault_tenant_id"] is None
+    assert narrowed_kwargs["vault_owner_id"] is None
+    assert missing_identity_kwargs["enabled_toolsets_override"] == ["memory"]
+    assert missing_identity_kwargs["vault_tenant_id"] is None
+    assert missing_identity_kwargs["vault_owner_id"] is None
+    assert plain_kwargs["enabled_toolsets_override"] is None
+    assert plain_kwargs["vault_tenant_id"] is None
+    assert plain_kwargs["vault_owner_id"] is None
 
 
 @pytest.mark.asyncio
