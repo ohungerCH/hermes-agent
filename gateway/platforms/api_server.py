@@ -3091,6 +3091,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     owner_id=owner_id,
                     content_type=content_type,
                     byte_size=len(raw_bytes or b""),
+                    # Keep = Owner-Kuratierung: Provenienz-Upgrade wie vor der
+                    # Helper-Extraktion (Review 22.07./W1).
+                    source=SOURCE_FOREGROUND_OWNER,
+                    trust_level=TRUST_TRUSTED,
                 )
             except Exception:
                 return {"status": "error", "object_key": None}

@@ -18,7 +18,9 @@ from typing import Any, Optional
 
 from tools.vault.vault_store import (
     ObjectMetadataWrite,
+    SOURCE_FOREGROUND_OWNER,
     SOURCE_INGEST,
+    TRUST_TRUSTED,
     TRUST_UNTRUSTED,
 )
 
@@ -225,14 +227,26 @@ class AttachmentStore:
             owner_id=owner_id,
             content_type=content_type,
             byte_size=len(raw_bytes),
+            # Keep = bewusstes Owner-Kuratieren: gleiche Provenienz wie der
+            # api_server-Keep-Pfad (Review 22.07./W1; _OWNER_RESURRECT haengt
+            # an source == foreground_owner).
+            source=SOURCE_FOREGROUND_OWNER,
+            trust_level=TRUST_TRUSTED,
             key_ref=encrypted["key_ref"],
         )
         return True
 
     def finalize_archive_promotion(self, object_key: str, *, tenant_id: str,
                                    owner_id: str, content_type: str,
-                                   byte_size: int, key_ref: Optional[str] = None) -> None:
-        """Finalisiert die gemeinsame Promotion nach durablem Archiv-Ciphertext."""
+                                   byte_size: int, source: str, trust_level: str,
+                                   key_ref: Optional[str] = None) -> None:
+        """Finalisiert die gemeinsame Promotion nach durablem Archiv-Ciphertext.
+
+        source/trust_level sind PFLICHT und kommen vom Aufrufer: eine
+        Keep-Promotion ist Owner-Kuratierung (foreground_owner/trusted, wie
+        der alte Inline-Keep vor der Helper-Extraktion). Ein Hardcode auf
+        ingest/untrusted waere ein stiller Provenienz-Downgrade --
+        _OWNER_RESURRECT (vault_store) haengt an source (Review 22.07./W1)."""
         row = self._metadata.read_object_metadata(
             tenant_id=tenant_id,
             owner_id=owner_id,
@@ -243,8 +257,8 @@ class AttachmentStore:
         promoted = self._metadata.write_object_metadata(ObjectMetadataWrite(
             tenant_id=tenant_id,
             owner_id=owner_id,
-            source=SOURCE_INGEST,
-            trust_level=TRUST_UNTRUSTED,
+            source=source,
+            trust_level=trust_level,
             object_key=object_key,
             key_ref=key_ref or row.get("key_ref") or "",
             expires_at=None,

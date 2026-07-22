@@ -18,6 +18,8 @@ class MetadataRepo:
             "owner_id": req.owner_id,
             "object_key": req.object_key,
             "key_ref": req.key_ref,
+            "source": req.source,
+            "trust_level": req.trust_level,
             "expires_at": req.expires_at,
             "content_type": req.content_type,
             "byte_size": req.byte_size,
@@ -100,6 +102,11 @@ def test_promote_to_archive_is_idempotent_and_unlinks_transient_last(tmp_path):
         owner_id="owner-a",
     ) is True
     assert repo.rows[record.object_key]["expires_at"] is None
+    # Review 22.07./W1: Keep-Promotion schreibt Owner-Kuratierung, nie
+    # ingest/untrusted (_OWNER_RESURRECT haengt an source).
+    assert repo.rows[record.object_key]["source"] == "foreground_owner"
+    assert repo.rows[record.object_key]["trust_level"] == "trusted"
+    assert repo.rows[record.object_key]["key_ref"].startswith("per_owner_domain:")
     assert (root / "archive" / f"{record.object_key}.json").exists()
     assert not (root / "transient" / f"{record.object_key}.json").exists()
     assert store.load(

@@ -336,6 +336,7 @@ def test_memory_write_skips_embed_trigger_when_not_persisted():
 
 def test_keep_reuses_promotion_helper_without_losing_embed_trigger():
     events = []
+    promotions = []
 
     class KeepAttachmentStore(FakeAttachmentStore):
         _crypto = object()
@@ -349,6 +350,7 @@ def test_keep_reuses_promotion_helper_without_losing_embed_trigger():
 
         def finalize_archive_promotion(self, *args, **kwargs):
             events.append("promotion_finalize")
+            promotions.append(kwargs)
 
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     attachment_store = KeepAttachmentStore()
@@ -387,3 +389,7 @@ def test_keep_reuses_promotion_helper_without_losing_embed_trigger():
     assert result == {"status": "written", "object_key": "att_0123456789abcdef"}
     assert captured[0].raw_bytes == b"archive-copy"
     assert events == ["archive_copy", "persist", "embed", "promotion_finalize"]
+    # Review 22.07./W1: der Keep-Pfad muss die Owner-Kuratierung uebergeben --
+    # der Helper darf sie nicht stillschweigend auf ingest/untrusted druecken.
+    assert promotions[0]["source"] == "foreground_owner"
+    assert promotions[0]["trust_level"] == "trusted"
