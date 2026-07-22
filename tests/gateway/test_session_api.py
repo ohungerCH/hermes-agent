@@ -912,6 +912,35 @@ def test_last_memory_tool_outcome_does_not_expose_legacy_error_details():
         end_memory_tool_turn(turn_context)
 
 
+def test_recall_memory_tool_outcome_is_read_action_not_write_failure():
+    """R6/N2: Recall bleibt als Leseaktion erkennbar und wird nie zum Schreibfehler."""
+    from tools.memory_tool import (
+        begin_memory_tool_turn,
+        end_memory_tool_turn,
+        get_last_memory_tool_outcome,
+        record_memory_tool_outcome,
+    )
+
+    turn_context = begin_memory_tool_turn()
+    try:
+        record_memory_tool_outcome(
+            "recall",
+            {
+                "action": "recall",
+                "available": True,
+                "matches": [],
+                "note": "Kein Treffer zu dieser Anfrage im gemerkten Gedächtnis.",
+            },
+        )
+        assert get_last_memory_tool_outcome() == {
+            "action": "recall",
+            "outcome": "recalled",
+            "message": "Kein Treffer zu dieser Anfrage im gemerkten Gedächtnis.",
+        }
+    finally:
+        end_memory_tool_turn(turn_context)
+
+
 @pytest.mark.asyncio
 async def test_run_agent_sets_nonempty_vault_write_identity(adapter):
     class FakeAgent:

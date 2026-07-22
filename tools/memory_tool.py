@@ -78,7 +78,12 @@ def record_memory_tool_outcome(action: Any, raw_result: Any) -> None:
     data = parsed if isinstance(parsed, dict) else {}
     normalized_action = str(action or data.get("action") or "unknown")
     outcome = data.get("outcome")
-    if not isinstance(outcome, str) or not outcome:
+    if normalized_action == "recall":
+        # Recall ist eine reine Leseaktion. Das Resultat besitzt absichtlich
+        # keinen Schreib-outcome und darf deshalb nie als Write-Fehler in der
+        # Voice-Bridge erscheinen (Task 19, R6/N2).
+        outcome = "recalled"
+    elif not isinstance(outcome, str) or not outcome:
         if data.get("staged") is True:
             outcome = "store_unavailable"
         elif data.get("success") is True:
@@ -88,7 +93,7 @@ def record_memory_tool_outcome(action: Any, raw_result: Any) -> None:
     # Nur explizite Produktmeldungen dürfen bis zur Voice-Bridge gelangen.
     # Legacy-``error``-Felder können englische Validierungsdetails oder interne
     # Speichertexte enthalten und sind daher keine vorlese-taugliche Autorität.
-    message = data.get("message")
+    message = data.get("note") if normalized_action == "recall" else data.get("message")
     if not isinstance(message, str) or not message.strip():
         message = "Die Änderung wurde nicht bestätigt"
     _last_tool_outcome.set({

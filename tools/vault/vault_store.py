@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
@@ -46,6 +47,19 @@ from tools.vault.vault_context import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_memory_item_id(value: Any) -> Optional[str]:
+    """Liefert eine kanonische UUID oder ``None``, ohne eine DB zu berühren."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip().lower()
+    try:
+        parsed = uuid.UUID(candidate)
+    except (AttributeError, ValueError):
+        return None
+    canonical = str(parsed)
+    return canonical if candidate == canonical else None
 
 
 # ---------------------------------------------------------------------------
@@ -703,12 +717,13 @@ class VaultStore:
             owner = normalize_context_value(owner_id, "owner_id")
         except VaultContextError:
             return MemoryItemLookupResult(available=False)
-        if not isinstance(item_id, str) or not item_id.strip():
+        normalized_item_id = normalize_memory_item_id(item_id)
+        if normalized_item_id is None:
             return MemoryItemLookupResult(available=True)
         conn = self._connect()
         try:
             with vault_transaction(conn, tenant, owner) as cur:
-                cur.execute(_MEMORY_ITEM_BY_ID, (item_id.strip(),))
+                cur.execute(_MEMORY_ITEM_BY_ID, (normalized_item_id,))
                 row = cur.fetchone()
         except BaseException as e:  # noqa: BLE001
             try:
@@ -739,13 +754,14 @@ class VaultStore:
             owner = normalize_context_value(owner_id, "owner_id")
         except VaultContextError as e:
             return WriteResult(status=STATUS_REFUSED, persisted=False, message=str(e))
-        if not isinstance(item_id, str) or not item_id.strip():
-            return WriteResult(status=STATUS_REFUSED, persisted=False, message="item_id fehlt")
+        normalized_item_id = normalize_memory_item_id(item_id)
+        if normalized_item_id is None:
+            return WriteResult(status=STATUS_REFUSED, persisted=False, message="item_id ist ungültig")
         conn = self._connect()
         affected = 0
         try:
             with vault_transaction(conn, tenant, owner) as cur:
-                cur.execute(_MEMORY_ITEM_DELETE_BY_ID, (item_id.strip(),))
+                cur.execute(_MEMORY_ITEM_DELETE_BY_ID, (normalized_item_id,))
                 rc = getattr(cur, "rowcount", 0)
                 affected = rc if isinstance(rc, int) and rc > 0 else 0
             conn.commit()

@@ -452,6 +452,41 @@ def test_item_id_lookup_and_tombstone_are_rls_scoped():
     assert removed.persisted is True and removed.memory_item_written is True
 
 
+def test_invalid_item_id_never_touches_db_and_followup_query_uses_clean_connection():
+    """R8: UUID-Validierung geschieht vor SQL; derselbe Connection-State bleibt nutzbar."""
+    valid_item_id = "11111111-1111-1111-1111-111111111111"
+    conn = FakeConn(fetchone_result=(
+        valid_item_id,
+        vs.SOURCE_TABLE_OBJECT,
+        "att_0123456789abcdef",  # gitleaks:allow -- test fixture, not a secret
+    ))
+    store = _store(conn)
+
+    invalid_lookup = store.read_memory_item_by_id(
+        tenant_id="tenant-a",
+        owner_id="owner-primary",
+        item_id="kein-uuid",
+    )
+    invalid_delete = store.tombstone_memory_item_by_id(
+        tenant_id="tenant-a",
+        owner_id="owner-primary",
+        item_id="kein-uuid",
+    )
+    assert invalid_lookup.available is True and invalid_lookup.item is None
+    assert invalid_delete.persisted is False
+    assert conn.executed == []
+    assert conn.rolled_back is False
+
+    followup = store.read_memory_item_by_id(
+        tenant_id="tenant-a",
+        owner_id="owner-primary",
+        item_id=valid_item_id,
+    )
+    assert followup.available is True
+    assert followup.item.item_id == valid_item_id
+    assert conn.rolled_back is False
+
+
 def test_transient_expiry_tombstones_only_metadata_not_permanent_memory():
     conn = FakeConn(update_rowcount=1)
     res = _store(conn).delete_transient_object(

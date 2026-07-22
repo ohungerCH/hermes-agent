@@ -313,15 +313,18 @@ def vault_remove_by_item_id(
 ) -> Dict[str, Any]:
     """Löscht eine Dokument-Erinnerung über ihre owner-sichtbare stabile ID.
 
-    ``forget_memory_keep_object`` sichert ein transientes Objekt zuerst dauerhaft
-    und tombstoned danach nur die Meaning-Zeile. ``forget_full`` behält die
-    bestehende Privacy-Reihenfolge: Ciphertext zuerst, dann Objekt- und Meaning-
-    Tombstones. Jede DB-Operation läuft in ``VaultStore`` unter ``vault_transaction``.
+    ``forget_memory_keep_object`` verweigert den Split für server-lokale Objekte,
+    damit kein unsichtbares Datengrab entsteht. ``forget_full`` behält die bestehende
+    Privacy-Reihenfolge: Ciphertext zuerst, dann Objekt- und Meaning-Tombstones.
+    Jede DB-Operation läuft in ``VaultStore`` unter ``vault_transaction``.
     """
-    if not isinstance(item_id, str) or not item_id.strip():
+    from tools.vault.vault_store import normalize_memory_item_id
+
+    normalized_item_id = normalize_memory_item_id(item_id)
+    if normalized_item_id is None:
         return _remove_outcome(
             "not_found",
-            "Ohne gültige Erinnerungs-ID konnte keine Erinnerung bestimmt werden",
+            "Die Erinnerung wurde nicht gefunden oder ist bereits gelöscht",
         )
     if operation not in {"forget_memory_keep_object", "forget_full"}:
         return _remove_outcome(
@@ -344,7 +347,7 @@ def vault_remove_by_item_id(
         lookup = metadata.read_memory_item_by_id(
             tenant_id=tenant_id,
             owner_id=owner_id,
-            item_id=item_id.strip(),
+            item_id=normalized_item_id,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("vault item-id lookup failed: %s", type(e).__name__)
@@ -384,49 +387,24 @@ def vault_remove_by_item_id(
                 "Das Dokument konnte nicht vollständig gelöscht werden",
             )
     else:
-        # Zwingende Reihenfolge: Objekt dauerhaft sichern, ERST DANACH
-        # die Meaning-Zeile tombstonen. Ein Promotion-Fehler löscht nichts.
-        try:
-            attachment_store.promote_to_archive(
-                object_key,
-                tenant_id=tenant_id,
-                owner_id=owner_id,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("vault document promotion failed: %s", type(e).__name__)
-            return _remove_outcome(
-                "promotion_failed",
-                "Das Dokument konnte nicht dauerhaft gesichert werden; die Erinnerung blieb erhalten",
-            )
-        try:
-            result = metadata.tombstone_memory_item_by_id(
-                tenant_id=tenant_id,
-                owner_id=owner_id,
-                item_id=item_id.strip(),
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("vault document memory tombstone failed: %s", type(e).__name__)
-            return _remove_outcome(
-                "store_unavailable",
-                "Die Erinnerung konnte gerade nicht entfernt werden",
-            )
+        # Server-lokale Objekte dürfen über Sprache nie von ihrer einzigen
+        # sichtbaren Meaning-Zeile getrennt werden. Der bewiesene Promotion-
+        # Code bleibt im Attachment-Store für den expliziten API-Keep-Pfad.
+        # Ein Split wird erst für extern-originierte Bibliotheksdokumente
+        # wieder geöffnet, deren Original ausserhalb von Jarvis auffindbar ist.
+        return _remove_outcome(
+            "keep_would_orphan",
+            "Das Dokument liegt nur bei mir - ohne die Erinnerung würde es verwaisen. "
+            "Sag 'Vergiss beides', dann lösche ich Dokument und Erinnerung zusammen",
+        )
     if not getattr(result, "persisted", False):
         return _remove_outcome(
             "store_unavailable",
             "Die Änderung konnte nicht dauerhaft gespeichert werden",
         )
-    if operation != "forget_full" and not getattr(result, "memory_item_written", False):
-        return _remove_outcome(
-            "not_found",
-            "Die Erinnerung wurde nicht gefunden oder ist bereits gelöscht",
-        )
     return _remove_outcome(
         "removed",
-        (
-            "Das Dokument und die verknüpfte Erinnerung wurden gelöscht"
-            if operation == "forget_full"
-            else "Die Erinnerung wurde entfernt; das Dokument bleibt erhalten"
-        ),
+        "Das Dokument und die verknüpfte Erinnerung wurden gelöscht",
         success=True,
     )
 

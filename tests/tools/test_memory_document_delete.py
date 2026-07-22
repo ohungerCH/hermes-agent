@@ -19,8 +19,10 @@ class _Metadata:
         self.promotion_fails = promotion_fails
         self.tombstoned = []
         self.forgotten = []
+        self.reads = []
 
     def read_memory_item_by_id(self, **kwargs):
+        self.reads.append(kwargs)
         return type("Lookup", (), {"available": True, "item": self.ref})()
 
     def tombstone_memory_item_by_id(self, **kwargs):
@@ -66,8 +68,8 @@ def _document_ref(item_id="11111111-1111-1111-1111-111111111111"):
     )()
 
 
-def test_remove_per_item_id_tombstones_owner_scoped_object_memory(monkeypatch):
-    """R1/R5: item_id ist primär; der DB-Zugriff bleibt über die Owner-Identität gebunden."""
+def test_remove_per_item_id_refuses_to_orphan_server_local_document(monkeypatch):
+    """R7: Der Sprach-Split lässt kein server-lokales Objekt ohne Meaning zurück."""
     _arm_identity(monkeypatch)
     metadata = _Metadata(_document_ref())
     attachment_store = _AttachmentStore(metadata, archived=True)
@@ -84,17 +86,14 @@ def test_remove_per_item_id_tombstones_owner_scoped_object_memory(monkeypatch):
         store=MemoryStore(),
     ))
 
-    assert out["outcome"] == "removed"
-    assert metadata.tombstoned == [{
-        "tenant_id": "tenant-a",
-        "owner_id": "owner-a",
-        "item_id": "11111111-1111-1111-1111-111111111111",
-    }]
-    assert attachment_store.promotions[0][0] == "att_0123456789abcdef"
+    assert out["outcome"] == "keep_would_orphan"
+    assert "Vergiss beides" in out["message"]
+    assert metadata.tombstoned == []
+    assert attachment_store.promotions == []
 
 
-def test_forget_memory_keep_object_promotes_then_tombstones_or_aborts(monkeypatch):
-    """R2: transient wird zuerst promoviert; archiviert wird nur tombstoned; Fehler löscht nichts."""
+def test_forget_memory_keep_object_never_promotes_or_tombstones_object_metadata(monkeypatch):
+    """R7: object_metadata wird unabhängig vom Archivstatus ohne Teilzustand verweigert."""
     _arm_identity(monkeypatch)
 
     transient_metadata = _Metadata(_document_ref("22222222-2222-2222-2222-222222222222"))
@@ -103,9 +102,9 @@ def test_forget_memory_keep_object_promotes_then_tombstones_or_aborts(monkeypatc
         "22222222-2222-2222-2222-222222222222",
         attachment_store=transient_store,
     )
-    assert transient["outcome"] == "removed"
-    assert len(transient_store.promotions) == 1
-    assert len(transient_metadata.tombstoned) == 1
+    assert transient["outcome"] == "keep_would_orphan"
+    assert transient_store.promotions == []
+    assert transient_metadata.tombstoned == []
 
     archived_metadata = _Metadata(_document_ref("33333333-3333-3333-3333-333333333333"))
     archived_store = _AttachmentStore(archived_metadata, archived=True)
@@ -113,8 +112,9 @@ def test_forget_memory_keep_object_promotes_then_tombstones_or_aborts(monkeypatc
         "33333333-3333-3333-3333-333333333333",
         attachment_store=archived_store,
     )
-    assert archived["outcome"] == "removed"
-    assert len(archived_metadata.tombstoned) == 1
+    assert archived["outcome"] == "keep_would_orphan"
+    assert archived_store.promotions == []
+    assert archived_metadata.tombstoned == []
 
     failed_metadata = _Metadata(_document_ref("44444444-4444-4444-4444-444444444444"))
     failed_store = _AttachmentStore(failed_metadata, promotion_fails=True)
@@ -122,8 +122,31 @@ def test_forget_memory_keep_object_promotes_then_tombstones_or_aborts(monkeypatc
         "44444444-4444-4444-4444-444444444444",
         attachment_store=failed_store,
     )
-    assert failed["outcome"] == "promotion_failed"
+    assert failed["outcome"] == "keep_would_orphan"
+    assert failed_store.promotions == []
     assert failed_metadata.tombstoned == []
+
+
+def test_invalid_item_id_is_not_found_without_store_access(monkeypatch):
+    """R8: Eine erfundene Nicht-UUID erreicht weder Lookup noch Promotion."""
+    _arm_identity(monkeypatch)
+    metadata = _Metadata(_document_ref())
+    attachment_store = _AttachmentStore(metadata)
+    monkeypatch.setattr(
+        "tools.vault.attachment_store.create_attachment_store",
+        lambda: attachment_store,
+    )
+
+    out = json.loads(memory_tool(
+        action="remove",
+        target="memory",
+        item_id="kein-uuid",
+        store=MemoryStore(),
+    ))
+
+    assert out["outcome"] == "not_found"
+    assert metadata.reads == []
+    assert attachment_store.promotions == []
 
 
 def test_item_id_for_native_class_is_class_not_removable(monkeypatch):
