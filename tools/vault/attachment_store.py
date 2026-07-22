@@ -189,6 +189,75 @@ class AttachmentStore:
             except OSError as exc:
                 raise AttachmentStoreError("attachment deletion failed") from exc
 
+    def promote_to_archive(self, object_key: str, *, tenant_id: str,
+                           owner_id: str, original: bool = False) -> bool:
+        """Sichert ein transientes Objekt dauerhaft, bevor Meaning gelöscht wird.
+
+        Rückgabe ``True`` bedeutet neu promoviert, ``False`` bereits archiviert.
+        Reihenfolge: lesen/konvertieren -> Archiv-Ciphertext -> expires_at=NULL ->
+        Transient-Unlink. Jeder Fehler vor dem letzten Schritt lässt das transiente
+        Original und damit die Wiederholbarkeit erhalten.
+        """
+        row = self._metadata.read_object_metadata(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            object_key=object_key,
+        )
+        if not row:
+            raise AttachmentStoreError("attachment metadata unavailable")
+        if row.get("expires_at") is None:
+            return False
+        loaded = self.load(
+            object_key,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+        raw_bytes, content_type = self.archive_copy(
+            loaded.data,
+            loaded.content_type,
+            original=original,
+        )
+        encrypted = self._crypto.encrypt(raw_bytes, owner_id=owner_id)
+        self.write_archive_envelope(object_key, encrypted["envelope"])
+        self.finalize_archive_promotion(
+            object_key,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            content_type=content_type,
+            byte_size=len(raw_bytes),
+            key_ref=encrypted["key_ref"],
+        )
+        return True
+
+    def finalize_archive_promotion(self, object_key: str, *, tenant_id: str,
+                                   owner_id: str, content_type: str,
+                                   byte_size: int, key_ref: Optional[str] = None) -> None:
+        """Finalisiert die gemeinsame Promotion nach durablem Archiv-Ciphertext."""
+        row = self._metadata.read_object_metadata(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            object_key=object_key,
+        )
+        if not row:
+            raise AttachmentStoreError("attachment metadata unavailable")
+        promoted = self._metadata.write_object_metadata(ObjectMetadataWrite(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            source=SOURCE_INGEST,
+            trust_level=TRUST_UNTRUSTED,
+            object_key=object_key,
+            key_ref=key_ref or row.get("key_ref") or "",
+            expires_at=None,
+            content_type=content_type,
+            byte_size=byte_size,
+        ))
+        if not getattr(promoted, "persisted", False):
+            raise AttachmentStoreError("attachment promotion was not persisted")
+        try:
+            self._path(object_key).unlink(missing_ok=True)
+        except OSError as exc:
+            raise AttachmentStoreError("transient attachment cleanup failed") from exc
+
     @staticmethod
     def exif_context(data: bytes, content_type: str) -> "tuple[bytes, str]":
         """Liest Aufnahmezeit + GPS LOKAL aus (Pillow, kein Egress) und liefert
@@ -292,3 +361,22 @@ class PooledVaultMetadataStore:
 
     def forget_object(self, **kwargs: Any) -> Any:
         return self._call("forget_object", **kwargs)
+
+    def read_memory_item_by_id(self, **kwargs: Any) -> Any:
+        return self._call("read_memory_item_by_id", **kwargs)
+
+    def tombstone_memory_item_by_id(self, **kwargs: Any) -> Any:
+        return self._call("tombstone_memory_item_by_id", **kwargs)
+
+
+def create_attachment_store() -> AttachmentStore:
+    """Baut den profilgebundenen AttachmentStore für API- und Memory-Pfade."""
+    from hermes_constants import get_hermes_home
+    from tools.vault.object_store_crypto import ObjectStoreCrypto
+
+    root = get_hermes_home() / "jarvis-attachments"
+    return AttachmentStore(
+        root=root,
+        crypto=ObjectStoreCrypto(root / "keys"),
+        metadata_store=PooledVaultMetadataStore(),
+    )

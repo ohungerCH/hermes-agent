@@ -264,12 +264,35 @@ class RecallItem:
     """Eine zurückgeholte Zeile. ``summary`` ist der ROHE summary_redacted-Plaintext -- das
     untrusted-Wrapping passiert am Modell-Rand (vault_wiring._wrap_recalled), NICHT hier (Trennung
     Datenzugriff vs. Präsentation; der Store liefert Daten, die Naht neutralisiert sie)."""
+    item_id: str
     source_table: str
     source_id: str
     summary: str
     created_at: Any
     sensitivity: str
     from_untrusted_inbound: bool
+
+    @property
+    def object_key(self) -> Optional[str]:
+        """Stabile Objekt-Referenz nur für Dokument-/Objekt-Erinnerungen."""
+        return self.source_id if self.source_table == SOURCE_TABLE_OBJECT else None
+
+
+@dataclass(frozen=True)
+class MemoryItemReference:
+    """Owner-scoped Referenz einer aktiven memory_items-Zeile."""
+
+    item_id: str
+    source_table: str
+    source_id: str
+
+
+@dataclass(frozen=True)
+class MemoryItemLookupResult:
+    """Unterscheidet echten 0-Treffer von einem nicht verfügbaren Store."""
+
+    available: bool
+    item: Optional[MemoryItemReference] = None
 
 
 @dataclass
@@ -402,6 +425,17 @@ _LINKED_MEMORY_DELETE = (
     "AND source_id = %s AND deleted_at IS NULL"
 )
 
+_MEMORY_ITEM_BY_ID = (
+    "SELECT id, source_table, source_id FROM public.memory_items "
+    "WHERE id = %s AND deleted_at IS NULL AND quarantined_at IS NULL "
+    "AND superseded_at IS NULL"
+)
+_MEMORY_ITEM_DELETE_BY_ID = (
+    "UPDATE public.memory_items SET deleted_at = now() "
+    "WHERE id = %s AND deleted_at IS NULL AND quarantined_at IS NULL "
+    "AND superseded_at IS NULL"
+)
+
 # §5b Invalidierung -- zielgerichteter UPDATE über den Natural-Key (kein Insert, kein Upsert:
 # ein Upsert könnte bei Cold-Start eine Geister-Tombstone-Zeile INSERTen; ein UPDATE mit 0
 # betroffenen Zeilen ist der saubere No-op). Läuft unter der Composite-Anker-Policy (FOR ALL,
@@ -437,7 +471,7 @@ _MEMORY_ITEMS_SUPERSEDE = (
 # (und die sind ohnehin candidate). Die Verteidigung gegen zitierte Injektion ist zusätzlich der
 # untrusted-Wrap am Rand.
 _MEMORY_ITEMS_RECALL = (
-    "SELECT source_table, source_id, summary_redacted, created_at, sensitivity, from_untrusted_inbound "
+    "SELECT id, source_table, source_id, summary_redacted, created_at, sensitivity, from_untrusted_inbound "
     "FROM public.memory_items, websearch_to_tsquery('german', %s) AS q "
     "WHERE lifecycle_status = 'confirmed' "
     "AND deleted_at IS NULL AND quarantined_at IS NULL AND superseded_at IS NULL "
@@ -457,7 +491,7 @@ _MEMORY_ITEMS_RECALL = (
 # Timing-Seitenkanal). tenant/owner NIE im Query-Text -- die Composite-Anker-Policy trägt sie.
 # Params: (embedding_version, query_vektor_literal, limit).
 _MEMORY_ITEMS_RECALL_KNN = (
-    "SELECT source_table, source_id, summary_redacted, created_at, sensitivity, from_untrusted_inbound "
+    "SELECT id, source_table, source_id, summary_redacted, created_at, sensitivity, from_untrusted_inbound "
     "FROM public.memory_items "
     "WHERE lifecycle_status = 'confirmed' "
     "AND deleted_at IS NULL AND quarantined_at IS NULL AND superseded_at IS NULL "
@@ -654,6 +688,83 @@ class VaultStore:
             logger.warning("vault object metadata read failed: %s", type(e).__name__)
             return None
         return self._object_row(row)
+
+    def read_memory_item_by_id(self, *, tenant_id: str, owner_id: str,
+                               item_id: str) -> MemoryItemLookupResult:
+        """Liest eine aktive stabile Referenz unter der Composite-RLS-Identität.
+
+        Tenant/Owner stehen absichtlich nicht im SELECT. ``vault_transaction`` setzt
+        beide server-autoritativen GUCs; die Tabellen-RLS entscheidet, ob die ID für
+        diesen Owner sichtbar ist. Eine erratene fremde ID wird dadurch zum echten
+        0-Treffer und nie zu einem Cross-Owner-Seitenpfad.
+        """
+        try:
+            tenant = normalize_context_value(tenant_id, "tenant_id")
+            owner = normalize_context_value(owner_id, "owner_id")
+        except VaultContextError:
+            return MemoryItemLookupResult(available=False)
+        if not isinstance(item_id, str) or not item_id.strip():
+            return MemoryItemLookupResult(available=True)
+        conn = self._connect()
+        try:
+            with vault_transaction(conn, tenant, owner) as cur:
+                cur.execute(_MEMORY_ITEM_BY_ID, (item_id.strip(),))
+                row = cur.fetchone()
+        except BaseException as e:  # noqa: BLE001
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.warning("vault memory item lookup failed: %s", type(e).__name__)
+            return MemoryItemLookupResult(available=False)
+        if not row:
+            return MemoryItemLookupResult(available=True)
+        values = row if not isinstance(row, dict) else (
+            row.get("id"), row.get("source_table"), row.get("source_id"),
+        )
+        return MemoryItemLookupResult(
+            available=True,
+            item=MemoryItemReference(
+                item_id=str(values[0]),
+                source_table=str(values[1] or ""),
+                source_id=str(values[2] or ""),
+            ),
+        )
+
+    def tombstone_memory_item_by_id(self, *, tenant_id: str, owner_id: str,
+                                    item_id: str) -> WriteResult:
+        """Tombstoned genau eine aktive owner-sichtbare Meaning-Zeile per ID."""
+        try:
+            tenant = normalize_context_value(tenant_id, "tenant_id")
+            owner = normalize_context_value(owner_id, "owner_id")
+        except VaultContextError as e:
+            return WriteResult(status=STATUS_REFUSED, persisted=False, message=str(e))
+        if not isinstance(item_id, str) or not item_id.strip():
+            return WriteResult(status=STATUS_REFUSED, persisted=False, message="item_id fehlt")
+        conn = self._connect()
+        affected = 0
+        try:
+            with vault_transaction(conn, tenant, owner) as cur:
+                cur.execute(_MEMORY_ITEM_DELETE_BY_ID, (item_id.strip(),))
+                rc = getattr(cur, "rowcount", 0)
+                affected = rc if isinstance(rc, int) and rc > 0 else 0
+            conn.commit()
+        except BaseException as e:  # noqa: BLE001
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.error("vault memory item tombstone failed: %s", type(e).__name__)
+            return WriteResult(
+                status=STATUS_ERROR,
+                persisted=False,
+                message="Erinnerung konnte nicht gelöscht werden",
+            )
+        return WriteResult(
+            status=STATUS_INVALIDATED,
+            persisted=True,
+            memory_item_written=(affected > 0),
+        )
 
     def list_expired_objects(self, *, now: Any) -> list[Dict[str, Any]]:
         """Admin-local cleanup query; RLS still scopes rows to the configured owner."""
@@ -865,11 +976,11 @@ class VaultStore:
                                 message="Vault-Recall nicht ausführbar -- kein Gedächtnis-Zugriff")
 
         # Merge: knn zuerst (semantisches Ranking), dann tsvector-only (nicht schon in knn), dedup
-        # über den Natural-Key-Teil (source_table, source_id), cap limit.
+        # über die stabile item_id, cap limit.
         merged = []
         seen = set()
         for r in list(knn_rows) + list(ts_rows):
-            key = (r[0], r[1])
+            key = r[0]
             if key in seen:
                 continue
             seen.add(key)
@@ -916,12 +1027,12 @@ class VaultStore:
         items = []
         dropped = 0
         for r in (rows or []):
-            if r[0] not in RECALLABLE_SOURCE_TABLES:
+            if r[1] not in RECALLABLE_SOURCE_TABLES:
                 dropped += 1
                 continue
             items.append(RecallItem(
-                source_table=r[0], source_id=r[1], summary=(r[2] or ""),
-                created_at=r[3], sensitivity=r[4], from_untrusted_inbound=bool(r[5]),
+                item_id=str(r[0]), source_table=r[1], source_id=r[2], summary=(r[3] or ""),
+                created_at=r[4], sensitivity=r[5], from_untrusted_inbound=bool(r[6]),
             ))
         return items, dropped
 

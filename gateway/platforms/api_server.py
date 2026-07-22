@@ -2537,6 +2537,9 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": effective_session_id or session_id,
             "message": {"role": "assistant", "content": tts_text},
             "usage": usage,
+            "last_tool_outcome": (
+                result.get("last_tool_outcome") if isinstance(result, dict) else None
+            ),
         }
         if action_intent is not None:
             response_body["action_intent"] = action_intent
@@ -2894,19 +2897,9 @@ class APIServerAdapter(BasePlatformAdapter):
     def _ensure_attachment_store(self) -> Any:
         if self._attachment_store is not None:
             return self._attachment_store
-        from hermes_constants import get_hermes_home
-        from tools.vault.attachment_store import (
-            AttachmentStore,
-            PooledVaultMetadataStore,
-        )
-        from tools.vault.object_store_crypto import ObjectStoreCrypto
+        from tools.vault.attachment_store import create_attachment_store
 
-        root = get_hermes_home() / "jarvis-attachments"
-        self._attachment_store = AttachmentStore(
-            root=root,
-            crypto=ObjectStoreCrypto(root / "keys"),
-            metadata_store=PooledVaultMetadataStore(),
-        )
+        self._attachment_store = create_attachment_store()
         return self._attachment_store
 
     @classmethod
@@ -3026,7 +3019,6 @@ class APIServerAdapter(BasePlatformAdapter):
         from tools.vault import db_runtime
         from tools.vault.vault_store import (
             MemoryWrite,
-            ObjectMetadataWrite,
             RETENTION_PERMANENT_MEANING,
             SOURCE_FOREGROUND_OWNER,
             SOURCE_TABLE_OBJECT,
@@ -3045,7 +3037,9 @@ class APIServerAdapter(BasePlatformAdapter):
         source_id = attachment_ref
         if keep:
             raw_bytes, content_type = store.archive_copy(
-                loaded.data, loaded.content_type, original=(operation == "keep_original"),
+                loaded.data,
+                loaded.content_type,
+                original=(operation == "keep_original"),
             )
         request = MemoryWrite(
             content=content,
@@ -3090,28 +3084,16 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:  # noqa: BLE001 -- der Embed darf den Persist nie brechen
             pass
         if keep:
-            existing = store._metadata.read_object_metadata(
-                tenant_id=tenant_id, owner_id=owner_id, object_key=attachment_ref,
-            )
-            if not existing:
-                return {"status": "error", "object_key": None}
-            promoted = store._metadata.write_object_metadata(ObjectMetadataWrite(
-                tenant_id=tenant_id,
-                owner_id=owner_id,
-                source=SOURCE_FOREGROUND_OWNER,
-                trust_level=TRUST_TRUSTED,
-                object_key=attachment_ref,
-                key_ref=existing["key_ref"],
-                expires_at=None,
-                content_type=content_type,
-                byte_size=len(raw_bytes or b""),
-            ))
-            if not promoted.persisted:
-                return {"status": "error", "object_key": None}
             try:
-                store._path(attachment_ref).unlink(missing_ok=True)
-            except OSError:
-                pass
+                store.finalize_archive_promotion(
+                    attachment_ref,
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                    content_type=content_type,
+                    byte_size=len(raw_bytes or b""),
+                )
+            except Exception:
+                return {"status": "error", "object_key": None}
         return {"status": result.status, "object_key": attachment_ref if keep else None}
 
     async def _handle_attachment_memory(self, request: "web.Request") -> "web.Response":
@@ -3447,6 +3429,9 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": effective_session_id or session_id,
             "message": {"role": "assistant", "content": tts_text},
             "usage": usage,
+            "last_tool_outcome": (
+                result.get("last_tool_outcome") if isinstance(result, dict) else None
+            ),
         }
         if action_intent is not None:
             # additiv: nur vorhanden, wenn das Brain mindestens einen Marker-Block emittierte.
@@ -5614,8 +5599,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 reset_vault_write_identity,
                 set_vault_write_identity,
             )
+            from tools.memory_tool import (
+                begin_memory_tool_turn,
+                end_memory_tool_turn,
+                get_last_memory_tool_outcome,
+            )
 
             vault_tok = set_vault_write_identity(vault_tenant_id, vault_owner_id)
+            memory_outcome_tok = begin_memory_tool_turn()
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -5647,8 +5638,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 _eff_sid = getattr(agent, "session_id", session_id)
                 if isinstance(_eff_sid, str) and _eff_sid:
                     result["session_id"] = _eff_sid
+                result["last_tool_outcome"] = get_last_memory_tool_outcome()
                 return result, usage
             finally:
+                end_memory_tool_turn(memory_outcome_tok)
                 reset_vault_write_identity(vault_tok)
                 clear_session_vars(tokens)
 

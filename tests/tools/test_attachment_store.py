@@ -2,6 +2,8 @@ from datetime import datetime, timedelta, timezone
 import json
 import stat
 
+import pytest
+
 from tools.vault.attachment_store import AttachmentStore
 from tools.vault.object_store_crypto import ObjectStoreCrypto
 
@@ -15,6 +17,7 @@ class MetadataRepo:
             "tenant_id": req.tenant_id,
             "owner_id": req.owner_id,
             "object_key": req.object_key,
+            "key_ref": req.key_ref,
             "expires_at": req.expires_at,
             "content_type": req.content_type,
             "byte_size": req.byte_size,
@@ -76,6 +79,69 @@ def test_cleanup_removes_expired_ciphertext_and_metadata(tmp_path):
     assert store.cleanup_expired(now=created + timedelta(days=8)) == 1
     assert record.object_key not in repo.rows
     assert not (root / "transient" / f"{record.object_key}.json").exists()
+
+
+def test_promote_to_archive_is_idempotent_and_unlinks_transient_last(tmp_path):
+    root = tmp_path / "attachments"
+    repo = MetadataRepo()
+    store = AttachmentStore(root=root, crypto=ObjectStoreCrypto(root / "keys"), metadata_store=repo)
+    now = datetime.now(timezone.utc)
+    record = store.put_transient(
+        b"durable-document",
+        tenant_id="tenant-a",
+        owner_id="owner-a",
+        content_type="application/pdf",
+        now=now,
+    )
+
+    assert store.promote_to_archive(
+        record.object_key,
+        tenant_id="tenant-a",
+        owner_id="owner-a",
+    ) is True
+    assert repo.rows[record.object_key]["expires_at"] is None
+    assert (root / "archive" / f"{record.object_key}.json").exists()
+    assert not (root / "transient" / f"{record.object_key}.json").exists()
+    assert store.load(
+        record.object_key,
+        tenant_id="tenant-a",
+        owner_id="owner-a",
+    ).data == b"durable-document"
+
+    assert store.promote_to_archive(
+        record.object_key,
+        tenant_id="tenant-a",
+        owner_id="owner-a",
+    ) is False
+
+
+def test_promotion_failure_preserves_transient_object(tmp_path):
+    class FailingPromotionRepo(MetadataRepo):
+        def write_object_metadata(self, req):
+            if req.expires_at is None:
+                return type("Result", (), {"persisted": False, "status": "error"})()
+            return super().write_object_metadata(req)
+
+    root = tmp_path / "attachments"
+    repo = FailingPromotionRepo()
+    store = AttachmentStore(root=root, crypto=ObjectStoreCrypto(root / "keys"), metadata_store=repo)
+    record = store.put_transient(
+        b"must-survive",
+        tenant_id="tenant-a",
+        owner_id="owner-a",
+        content_type="application/pdf",
+        now=datetime.now(timezone.utc),
+    )
+
+    with pytest.raises(Exception, match="promotion"):
+        store.promote_to_archive(
+            record.object_key,
+            tenant_id="tenant-a",
+            owner_id="owner-a",
+        )
+
+    assert (root / "transient" / f"{record.object_key}.json").exists()
+    assert repo.rows[record.object_key]["expires_at"] is not None
 
 
 class TestExifContext:

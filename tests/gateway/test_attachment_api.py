@@ -332,3 +332,58 @@ def test_memory_write_skips_embed_trigger_when_not_persisted():
 
     assert result["status"] == "refused"
     embed.assert_not_called()
+
+
+def test_keep_reuses_promotion_helper_without_losing_embed_trigger():
+    events = []
+
+    class KeepAttachmentStore(FakeAttachmentStore):
+        _crypto = object()
+
+        def archive_copy(self, data, content_type, *, original):
+            events.append("archive_copy")
+            return b"archive-copy", "image/jpeg"
+
+        def write_archive_envelope(self, key, envelope):
+            events.append("archive_write")
+
+        def finalize_archive_promotion(self, *args, **kwargs):
+            events.append("promotion_finalize")
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    attachment_store = KeepAttachmentStore()
+    adapter._attachment_store = attachment_store
+    captured = []
+
+    class FakeVaultStore:
+        def __init__(self, **kwargs):
+            pass
+
+        def write(self, request):
+            events.append("persist")
+            captured.append(request)
+            return type("WriteResult", (), {"persisted": True, "status": "written"})()
+
+    pool = Mock()
+    pool.getconn.return_value = object()
+
+    def embed(*_args):
+        events.append("embed")
+
+    with (
+        patch("tools.vault.db_runtime.get_vault_pool", return_value=pool),
+        patch("tools.vault.vault_store.VaultStore", FakeVaultStore),
+        patch("tools.vault.vault_wiring._trigger_async_embed", embed),
+    ):
+        result = adapter._persist_attachment_extraction(
+            content="Aus Foto/Dokument übernommen: Vertrag",
+            operation="keep",
+            attachment_ref="att_0123456789abcdef",  # gitleaks:allow -- test fixture
+            loaded=attachment_store.loaded,
+            tenant_id="tenant-a",
+            owner_id="owner-a",
+        )
+
+    assert result == {"status": "written", "object_key": "att_0123456789abcdef"}
+    assert captured[0].raw_bytes == b"archive-copy"
+    assert events == ["archive_copy", "persist", "embed", "promotion_finalize"]

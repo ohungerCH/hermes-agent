@@ -295,6 +295,142 @@ def _do_vault_op(action: str, target: str, content: Optional[str], old_entry: Op
     return result.status
 
 
+def _remove_outcome(outcome: str, message: str, *, success: bool = False) -> Dict[str, Any]:
+    """Einheitliche, modell- und Bridge-lesbare Lösch-Rückgabe."""
+    return {
+        "success": success,
+        "action": "remove",
+        "outcome": outcome,
+        "message": message,
+    }
+
+
+def vault_remove_by_item_id(
+    item_id: str,
+    *,
+    operation: str = "forget_memory_keep_object",
+    attachment_store: Any = None,
+) -> Dict[str, Any]:
+    """Löscht eine Dokument-Erinnerung über ihre owner-sichtbare stabile ID.
+
+    ``forget_memory_keep_object`` sichert ein transientes Objekt zuerst dauerhaft
+    und tombstoned danach nur die Meaning-Zeile. ``forget_full`` behält die
+    bestehende Privacy-Reihenfolge: Ciphertext zuerst, dann Objekt- und Meaning-
+    Tombstones. Jede DB-Operation läuft in ``VaultStore`` unter ``vault_transaction``.
+    """
+    if not isinstance(item_id, str) or not item_id.strip():
+        return _remove_outcome(
+            "not_found",
+            "Ohne gültige Erinnerungs-ID konnte keine Erinnerung bestimmt werden",
+        )
+    if operation not in {"forget_memory_keep_object", "forget_full"}:
+        return _remove_outcome(
+            "class_not_removable",
+            "Diese Löschart wird für die Erinnerung nicht unterstützt",
+        )
+    identity = get_vault_write_identity()
+    if identity is None:
+        return _remove_outcome(
+            "store_unavailable",
+            "Der Erinnerungsspeicher ist gerade nicht verfügbar",
+        )
+    tenant_id, owner_id = identity
+    try:
+        if attachment_store is None:
+            from tools.vault.attachment_store import create_attachment_store
+
+            attachment_store = create_attachment_store()
+        metadata = attachment_store._metadata
+        lookup = metadata.read_memory_item_by_id(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            item_id=item_id.strip(),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("vault item-id lookup failed: %s", type(e).__name__)
+        return _remove_outcome(
+            "store_unavailable",
+            "Der Erinnerungsspeicher ist gerade nicht verfügbar",
+        )
+    if not getattr(lookup, "available", False):
+        return _remove_outcome(
+            "store_unavailable",
+            "Der Erinnerungsspeicher ist gerade nicht verfügbar",
+        )
+    ref = getattr(lookup, "item", None)
+    if ref is None:
+        return _remove_outcome(
+            "not_found",
+            "Die Erinnerung wurde nicht gefunden oder ist bereits gelöscht",
+        )
+    if getattr(ref, "source_table", "") != "object_metadata":
+        return _remove_outcome(
+            "class_not_removable",
+            "Diese Erinnerungsklasse kann nur über ihren bekannten Text entfernt werden",
+        )
+    object_key = getattr(ref, "source_id", "")
+    if operation == "forget_full":
+        try:
+            attachment_store.delete_ciphertext(object_key)
+            result = metadata.forget_object(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                object_key=object_key,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("vault full document remove failed: %s", type(e).__name__)
+            return _remove_outcome(
+                "store_unavailable",
+                "Das Dokument konnte nicht vollständig gelöscht werden",
+            )
+    else:
+        # Zwingende Reihenfolge: Objekt dauerhaft sichern, ERST DANACH
+        # die Meaning-Zeile tombstonen. Ein Promotion-Fehler löscht nichts.
+        try:
+            attachment_store.promote_to_archive(
+                object_key,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("vault document promotion failed: %s", type(e).__name__)
+            return _remove_outcome(
+                "promotion_failed",
+                "Das Dokument konnte nicht dauerhaft gesichert werden; die Erinnerung blieb erhalten",
+            )
+        try:
+            result = metadata.tombstone_memory_item_by_id(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                item_id=item_id.strip(),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("vault document memory tombstone failed: %s", type(e).__name__)
+            return _remove_outcome(
+                "store_unavailable",
+                "Die Erinnerung konnte gerade nicht entfernt werden",
+            )
+    if not getattr(result, "persisted", False):
+        return _remove_outcome(
+            "store_unavailable",
+            "Die Änderung konnte nicht dauerhaft gespeichert werden",
+        )
+    if operation != "forget_full" and not getattr(result, "memory_item_written", False):
+        return _remove_outcome(
+            "not_found",
+            "Die Erinnerung wurde nicht gefunden oder ist bereits gelöscht",
+        )
+    return _remove_outcome(
+        "removed",
+        (
+            "Das Dokument und die verknüpfte Erinnerung wurden gelöscht"
+            if operation == "forget_full"
+            else "Die Erinnerung wurde entfernt; das Dokument bleibt erhalten"
+        ),
+        success=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Recall (Lese-Naht) -- die zweite (und einzige lesende) von memory_tool gerufene Funktion
 # ---------------------------------------------------------------------------
@@ -384,8 +520,10 @@ def _do_vault_recall(query: str, target: str, tenant_id: str, owner_id: str,
         return {"available": False, "matches": [], "reason": res.status, "mode_used": res.mode_used}
     matches = [
         {
+            "item_id": it.item_id,
             "source": it.source_table,
             "content": _wrap_recalled(it.summary, it.source_table, it.from_untrusted_inbound),
+            **({"object_key": it.object_key} if it.object_key else {}),
         }
         for it in res.items
     ]

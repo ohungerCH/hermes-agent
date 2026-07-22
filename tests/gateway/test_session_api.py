@@ -843,6 +843,7 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
     )
 
     assert result["session_id"] == "request-session"
+    assert result["last_tool_outcome"] is None
     assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     assert observed == {
         "task_id": "request-session",
@@ -851,6 +852,64 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         "context_session_key": "request-key",
         "child_session_id": "request-session",
     }
+
+
+@pytest.mark.asyncio
+async def test_run_agent_returns_last_memory_tool_outcome(adapter):
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "scribe-session"
+
+        def run_conversation(self, user_message, conversation_history, task_id):
+            from tools.memory_tool import record_memory_tool_outcome
+
+            record_memory_tool_outcome(
+                "remove",
+                {
+                    "success": False,
+                    "outcome": "class_not_removable",
+                    "message": "Diese Erinnerungsklasse ist nicht löschbar",
+                },
+            )
+            return {"final_response": "Ich habe gelöscht."}
+
+    adapter._create_agent = Mock(return_value=FakeAgent())
+    result, _ = await adapter._run_agent(
+        user_message="Vergiss die Erinnerung.",
+        conversation_history=[],
+        session_id="scribe-session",
+    )
+
+    assert result["last_tool_outcome"] == {
+        "action": "remove",
+        "outcome": "class_not_removable",
+        "message": "Diese Erinnerungsklasse ist nicht löschbar",
+    }
+
+
+def test_last_memory_tool_outcome_does_not_expose_legacy_error_details():
+    from tools.memory_tool import (
+        begin_memory_tool_turn,
+        end_memory_tool_turn,
+        get_last_memory_tool_outcome,
+        record_memory_tool_outcome,
+    )
+
+    turn_context = begin_memory_tool_turn()
+    try:
+        record_memory_tool_outcome(
+            "add",
+            {"success": False, "error": "internal/path: validation detail"},
+        )
+        assert get_last_memory_tool_outcome() == {
+            "action": "add",
+            "outcome": "store_unavailable",
+            "message": "Die Änderung wurde nicht bestätigt",
+        }
+    finally:
+        end_memory_tool_turn(turn_context)
 
 
 @pytest.mark.asyncio
@@ -986,7 +1045,16 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
     session_db.append_message(session_id, "user", "earlier")
     session_db.append_message(session_id, "assistant", "prior answer")
 
-    mock_run = AsyncMock(return_value=({"final_response": "fresh answer", "session_id": session_id}, {"total_tokens": 3}))
+    tool_outcome = {
+        "action": "remove",
+        "outcome": "removed",
+        "message": "Die Erinnerung wurde entfernt",
+    }
+    mock_run = AsyncMock(return_value=({
+        "final_response": "fresh answer",
+        "session_id": session_id,
+        "last_tool_outcome": tool_outcome,
+    }, {"total_tokens": 3}))
     app = _create_session_app(auth_adapter)
     with patch.object(auth_adapter, "_run_agent", mock_run):
         async with TestClient(TestServer(app)) as cli:
@@ -1004,6 +1072,7 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
     assert payload["session_id"] == session_id
     assert payload["message"]["role"] == "assistant"
     assert payload["message"]["content"] == "fresh answer"
+    assert payload["last_tool_outcome"] == tool_outcome
     mock_run.assert_awaited_once()
     _, kwargs = mock_run.call_args
     assert kwargs["session_id"] == session_id

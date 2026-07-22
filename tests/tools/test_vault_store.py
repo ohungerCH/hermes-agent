@@ -412,6 +412,46 @@ def test_forget_object_marks_metadata_and_linked_memory_in_one_transaction():
     assert conn.committed is True
 
 
+def test_item_id_lookup_and_tombstone_are_rls_scoped():
+    item_id = "11111111-1111-1111-1111-111111111111"
+    lookup_conn = FakeConn(fetchone_result=(
+        item_id,
+        vs.SOURCE_TABLE_OBJECT,
+        "att_0123456789abcdef",  # gitleaks:allow -- test fixture, not a secret
+    ))
+    lookup = _store(lookup_conn).read_memory_item_by_id(
+        tenant_id="tenant-a",
+        owner_id="owner-primary",
+        item_id=item_id,
+    )
+
+    assert lookup.available is True
+    assert lookup.item.item_id == item_id
+    assert lookup.item.source_table == vs.SOURCE_TABLE_OBJECT
+    select_sql, select_params = next(
+        (sql, params) for sql, params in lookup_conn.executed
+        if "SELECT id, source_table, source_id" in sql
+    )
+    assert "tenant_id" not in select_sql and "owner_id" not in select_sql
+    assert select_params == (item_id,)
+    assert lookup_conn.executed[0][1] == ("jarvis.tenant_id", "tenant-a")
+    assert lookup_conn.executed[1][1] == ("jarvis.owner_id", "owner-primary")
+
+    delete_conn = FakeConn(update_rowcount=1)
+    removed = _store(delete_conn).tombstone_memory_item_by_id(
+        tenant_id="tenant-a",
+        owner_id="owner-primary",
+        item_id=item_id,
+    )
+    delete_sql, delete_params = next(
+        (sql, params) for sql, params in delete_conn.executed
+        if "WHERE id = %s" in sql and "SET deleted_at" in sql
+    )
+    assert "tenant_id" not in delete_sql and "owner_id" not in delete_sql
+    assert delete_params == (item_id,)
+    assert removed.persisted is True and removed.memory_item_written is True
+
+
 def test_transient_expiry_tombstones_only_metadata_not_permanent_memory():
     conn = FakeConn(update_rowcount=1)
     res = _store(conn).delete_transient_object(

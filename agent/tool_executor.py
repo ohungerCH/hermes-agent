@@ -1224,8 +1224,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     old_text=next_args.get("old_text"),
                     query=next_args.get("query"),      # Stufe-6 Recall: sonst query gedroppt
                     limit=next_args.get("limit"),
+                    item_id=next_args.get("item_id"),
+                    forget_mode=next_args.get("forget_mode"),
                     operations=operations,
                     store=agent._memory_store,
+                )
+                from tools.memory_tool import record_memory_tool_outcome
+                record_memory_tool_outcome(
+                    next_args.get("action") or ("batch" if operations else None),
+                    result,
                 )
                 # Mirror successful built-in memory writes to external
                 # providers. All gating/op-expansion lives behind the manager

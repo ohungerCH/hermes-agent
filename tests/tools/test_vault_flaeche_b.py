@@ -160,7 +160,7 @@ class _RecallCursor:
 
 
 def _knn_row():
-    return ("owner_memory", "h1", "Owner mag Kaffee", "2026-07-11T00:00:00Z", "personal_low", False)
+    return ("item-h1", "owner_memory", "h1", "Owner mag Kaffee", "2026-07-11T00:00:00Z", "personal_low", False)
 
 
 def _select_sql(conn):
@@ -274,11 +274,11 @@ class _HybridConn:
 
 
 def _row(sid, summary="x"):
-    return ("owner_memory", sid, summary, "2026-07-11T00:00:00Z", "personal_low", False)
+    return (f"item-{sid}", "owner_memory", sid, summary, "2026-07-11T00:00:00Z", "personal_low", False)
 
 
 def test_recall_hybrid_merges_knn_and_tsvector(monkeypatch):
-    """Hybrid: knn zuerst (semantisch), dann tsvector-only (neue/un-embeddete Zeilen); dedup source_id."""
+    """Hybrid: knn zuerst (semantisch), dann tsvector-only; dedup per stabiler item_id."""
     conn = _HybridConn(knn_rows=[_row("a"), _row("b")], ts_rows=[_row("b"), _row("c")])
     monkeypatch.setattr("tools.vault.embed_client.embed_texts", lambda texts: ec.EmbedResult(
         "local-bge-m3", "BAAI/bge-m3", "v1", 1024, [[0.02] * 1024]))

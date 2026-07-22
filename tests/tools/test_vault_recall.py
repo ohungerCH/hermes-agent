@@ -72,10 +72,11 @@ class FakePool:
 
 
 def _row(summary="Owner mag Kaffee schwarz", *, source_table="owner_memory",
-         source_id="h1", sensitivity="personal_low", untrusted=False):
-    # Spaltenreihenfolge = _MEMORY_ITEMS_RECALL: source_table, source_id, summary_redacted,
+         source_id="h1", sensitivity="personal_low", untrusted=False,
+         item_id="11111111-1111-1111-1111-111111111111"):
+    # Spaltenreihenfolge = _MEMORY_ITEMS_RECALL: id, source_table, source_id, summary_redacted,
     # created_at, sensitivity, from_untrusted_inbound
-    return (source_table, source_id, summary, "2026-07-10T00:00:00Z", sensitivity, untrusted)
+    return (item_id, source_table, source_id, summary, "2026-07-10T00:00:00Z", sensitivity, untrusted)
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +263,23 @@ def test_shadow_recall_wraps_matches(monkeypatch):
         assert "</recalled_memory> böse" not in m["content"]
 
 
+def test_shadow_recall_returns_stable_item_id_and_object_key(monkeypatch):
+    _arm(monkeypatch)
+    conn = RecallConn(rows=[_row(
+        "Dokumentinhalt",
+        source_table=vs.SOURCE_TABLE_OBJECT,
+        source_id="att_0123456789abcdef",  # gitleaks:allow -- test fixture, not a secret
+        item_id="22222222-2222-2222-2222-222222222222",
+    )])
+    from tools.vault import db_runtime
+    monkeypatch.setattr(db_runtime, "get_vault_pool", lambda: FakePool(conn))
+
+    out = vw.vault_shadow_recall("Dokument")
+
+    assert out["matches"][0]["item_id"] == "22222222-2222-2222-2222-222222222222"
+    assert out["matches"][0]["object_key"] == "att_0123456789abcdef"
+
+
 def test_shadow_recall_failsoft_on_pool_error(monkeypatch):
     """getconn/pool wirft -> fail-soft None (der Live-Turn hängt NIE)."""
     _arm(monkeypatch)
@@ -305,6 +323,8 @@ def test_agent_memory_branches_forward_query_and_limit():
         src = (root / rel).read_text(encoding="utf-8")
         assert 'query=next_args.get("query")' in src, f"{rel}: memory-Branch reicht query NICHT durch"
         assert 'limit=next_args.get("limit")' in src, f"{rel}: memory-Branch reicht limit NICHT durch"
+        assert 'item_id=next_args.get("item_id")' in src, f"{rel}: item_id wird gedroppt"
+        assert 'forget_mode=next_args.get("forget_mode")' in src, f"{rel}: forget_mode wird gedroppt"
 
 
 def test_tool_recall_requires_query():
