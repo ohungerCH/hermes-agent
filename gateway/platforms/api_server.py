@@ -2909,13 +2909,23 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         return self._attachment_store
 
-    @staticmethod
-    def _edge_attachment_identity(request: "web.Request") -> Optional[tuple[str, str, str]]:
+    @classmethod
+    def _edge_attachment_identity(cls, request: "web.Request") -> Optional[tuple[str, str, str]]:
         device = request.headers.get("X-Jarvis-Device-Id", "").strip()
         tenant = request.headers.get("X-Jarvis-Tenant-Id", "").strip()
         owner = request.headers.get("X-Jarvis-Owner-Id", "").strip()
-        if not device or not tenant or not owner:
+        if not device:
             return None
+        if not tenant or not owner:
+            # Single-Owner-Deploy: der Edge verifiziert den Bearer (diag-Introspect)
+            # und stampt NUR die Device-Id; Tenant/Owner-Header werden am Edge
+            # explizit GELEERT (client-override-safe) und hier aus der Server-Env
+            # aufgeloest. VOR Multiuser durch eine Introspektion mit
+            # Tenant/Owner-Verdikt ersetzen. Nie Client-Werte akzeptieren.
+            fallback = cls._single_owner_attachment_identity()
+            if fallback is None:
+                return None
+            tenant, owner = fallback
         if any(re.search(r"[\r\n\x00]", value) for value in (device, tenant, owner)):
             return None
         return device, tenant, owner
