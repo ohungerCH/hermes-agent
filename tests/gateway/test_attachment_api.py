@@ -262,3 +262,73 @@ def test_memory_write_uses_object_key_as_stable_source_even_without_keep():
     assert captured[0].source_table == SOURCE_TABLE_OBJECT
     assert captured[0].source_id == "att_0123456789abcdef"
     assert captured[0].raw_bytes is None
+
+
+def test_memory_write_triggers_async_embed_after_persist():
+    """Geraete-Befund 22.07.: ohne Embed-Trigger bleibt die Dokument-Zeile
+    KNN-blind (FTS rettet deutsche Komposita wie "Bruttozins" nicht)."""
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    attachment_store = FakeAttachmentStore()
+    attachment_store._crypto = object()
+    adapter._attachment_store = attachment_store
+
+    class FakeVaultStore:
+        def __init__(self, **kwargs):
+            pass
+
+        def write(self, request):
+            return type("WriteResult", (), {"persisted": True, "status": "written"})()
+
+    pool = Mock()
+    pool.getconn.return_value = object()
+    embed = Mock()
+    with (
+        patch("tools.vault.db_runtime.get_vault_pool", return_value=pool),
+        patch("tools.vault.vault_store.VaultStore", FakeVaultStore),
+        patch("tools.vault.vault_wiring._trigger_async_embed", embed),
+    ):
+        result = adapter._persist_attachment_extraction(
+            content="Aus Foto/Dokument übernommen: Zinsrechnung",
+            operation="remember",
+            attachment_ref="att_0123456789abcdef",  # gitleaks:allow -- test fixture, not a secret
+            loaded=attachment_store.loaded,
+            tenant_id="tenant-a",
+            owner_id="owner-a",
+        )
+
+    assert result["status"] == "written"
+    embed.assert_called_once_with("tenant-a", "owner-a")
+
+
+def test_memory_write_skips_embed_trigger_when_not_persisted():
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    attachment_store = FakeAttachmentStore()
+    attachment_store._crypto = object()
+    adapter._attachment_store = attachment_store
+
+    class FakeVaultStore:
+        def __init__(self, **kwargs):
+            pass
+
+        def write(self, request):
+            return type("WriteResult", (), {"persisted": False, "status": "refused"})()
+
+    pool = Mock()
+    pool.getconn.return_value = object()
+    embed = Mock()
+    with (
+        patch("tools.vault.db_runtime.get_vault_pool", return_value=pool),
+        patch("tools.vault.vault_store.VaultStore", FakeVaultStore),
+        patch("tools.vault.vault_wiring._trigger_async_embed", embed),
+    ):
+        result = adapter._persist_attachment_extraction(
+            content="Aus Foto/Dokument übernommen: refused",
+            operation="remember",
+            attachment_ref="att_0123456789abcdef",  # gitleaks:allow -- test fixture, not a secret
+            loaded=attachment_store.loaded,
+            tenant_id="tenant-a",
+            owner_id="owner-a",
+        )
+
+    assert result["status"] == "refused"
+    embed.assert_not_called()

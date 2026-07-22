@@ -3080,6 +3080,15 @@ class APIServerAdapter(BasePlatformAdapter):
             pool.putconn(conn)
         if not result.persisted:
             return {"status": result.status, "object_key": None}
+        # Suchvektor sofort anstossen (Geraete-Befund 22.07.: ohne diesen Trigger
+        # blieb die Dokument-Zeile KNN-blind, und FTS rettet deutsche Komposita
+        # wie "Bruttozins" nicht). Gleiches Muster wie der regulaere Memory-Write
+        # (vault_wiring: fire-and-forget Daemon-Thread, recall_mode-Gate, fail-soft).
+        try:
+            from tools.vault.vault_wiring import _trigger_async_embed
+            _trigger_async_embed(tenant_id, owner_id)
+        except Exception:  # noqa: BLE001 -- der Embed darf den Persist nie brechen
+            pass
         if keep:
             existing = store._metadata.read_object_metadata(
                 tenant_id=tenant_id, owner_id=owner_id, object_key=attachment_ref,
