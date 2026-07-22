@@ -76,3 +76,42 @@ def test_cleanup_removes_expired_ciphertext_and_metadata(tmp_path):
     assert store.cleanup_expired(now=created + timedelta(days=8)) == 1
     assert record.object_key not in repo.rows
     assert not (root / "transient" / f"{record.object_key}.json").exists()
+
+
+class TestExifContext:
+    """Slice-2-Verfeinerung: EXIF lokal lesen (Zeit/GPS) + Bild strippen."""
+
+    @staticmethod
+    def _jpeg_with_exif() -> bytes:
+        from io import BytesIO
+        from PIL import Image
+        image = Image.new("RGB", (32, 32), "blue")
+        exif = image.getexif()
+        exif[306] = "2026:07:22 14:03:00"  # DateTime
+        gps = exif.get_ifd(34853)
+        gps[1] = "N"; gps[2] = (47.0, 22.0, 12.0)
+        gps[3] = "E"; gps[4] = (8.0, 32.0, 24.0)
+        out = BytesIO()
+        image.save(out, format="JPEG", exif=exif)
+        return out.getvalue()
+
+    def test_reads_time_and_gps_and_strips(self):
+        from tools.vault.attachment_store import AttachmentStore
+        data = self._jpeg_with_exif()
+        stripped, ctx = AttachmentStore.exif_context(data, "image/jpeg")
+        assert "aufgenommen 2026:07:22 14:03:00" in ctx
+        assert "GPS 47.37" in ctx and "8.54" in ctx
+        # Das gestrippte Bild darf weder Zeit noch GPS mehr tragen.
+        from io import BytesIO
+        from PIL import Image
+        with Image.open(BytesIO(stripped)) as reloaded:
+            exif2 = reloaded.getexif()
+            assert not exif2.get(306)
+            assert not dict(exif2.get_ifd(34853) or {})
+
+    def test_failsoft_on_non_image_and_garbage(self):
+        from tools.vault.attachment_store import AttachmentStore
+        raw = b"not an image"
+        assert AttachmentStore.exif_context(raw, "application/pdf") == (raw, "")
+        data, ctx = AttachmentStore.exif_context(raw, "image/jpeg")
+        assert data == raw and ctx == ""

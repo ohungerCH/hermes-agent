@@ -190,6 +190,50 @@ class AttachmentStore:
                 raise AttachmentStoreError("attachment deletion failed") from exc
 
     @staticmethod
+    def exif_context(data: bytes, content_type: str) -> "tuple[bytes, str]":
+        """Liest Aufnahmezeit + GPS LOKAL aus (Pillow, kein Egress) und liefert
+        (bild_ohne_exif, kontext_text). Das gestrippte Bild geht zum Provider
+        (Datenminimierung: eingebettetes GPS verlaesst den Server nie); der
+        Kontext-Text fliesst in den Meta-Kontext des Gedaechtnis-Eintrags.
+        Fail-soft: bei jedem Fehler Original-Bytes + leerer Kontext."""
+        if not content_type.lower().startswith("image/"):
+            return data, ""
+        try:
+            from PIL import Image, ImageOps
+
+            parts = []
+            with Image.open(BytesIO(data)) as image:
+                exif = image.getexif()
+                taken = exif.get(36867) or exif.get(306)  # DateTimeOriginal | DateTime
+                if isinstance(taken, str) and taken.strip():
+                    parts.append("aufgenommen " + taken.strip())
+                try:
+                    gps = exif.get_ifd(34853)  # GPSInfo
+                except Exception:
+                    gps = None
+                if gps:
+                    def _deg(v, ref):
+                        try:
+                            d = float(v[0]) + float(v[1]) / 60 + float(v[2]) / 3600
+                            return -d if str(ref) in ("S", "W") else d
+                        except Exception:
+                            return None
+                    lat = _deg(gps.get(2), gps.get(1))
+                    lon = _deg(gps.get(4), gps.get(3))
+                    if lat is not None and lon is not None:
+                        parts.append(f"GPS {lat:.5f},{lon:.5f}")
+                image = ImageOps.exif_transpose(image)
+                output = BytesIO()
+                fmt = "PNG" if image.mode in ("RGBA", "LA", "P") else "JPEG"
+                if fmt == "JPEG" and image.mode not in ("RGB", "L"):
+                    image = image.convert("RGB")
+                image.save(output, format=fmt, quality=92)
+                stripped = output.getvalue()
+            return stripped, "; ".join(parts)
+        except Exception:
+            return data, ""
+
+    @staticmethod
     def archive_copy(data: bytes, content_type: str, *, original: bool) -> tuple[bytes, str]:
         """Return original bytes or a ~2000px JPEG archive copy for images."""
         if original or not content_type.lower().startswith("image/"):

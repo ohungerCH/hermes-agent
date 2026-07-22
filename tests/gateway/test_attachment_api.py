@@ -15,6 +15,10 @@ from tools.vault.vault_store import SOURCE_TABLE_OBJECT
 
 
 class FakeAttachmentStore:
+
+    @staticmethod
+    def exif_context(data, content_type):
+        return data, ""
     def __init__(self):
         self.put_calls = []
         self.loaded = type(
