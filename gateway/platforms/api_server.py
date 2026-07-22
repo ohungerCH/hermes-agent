@@ -3233,7 +3233,108 @@ class APIServerAdapter(BasePlatformAdapter):
                 await asyncio.to_thread(self._ensure_attachment_store().cleanup_expired)
             except Exception as exc:
                 logger.warning("attachment cleanup skipped: %s", type(exc).__name__)
+            try:
+                await asyncio.to_thread(self._maybe_write_memory_stats)
+            except Exception as exc:
+                logger.warning("memory stats skipped: %s", type(exc).__name__)
             await asyncio.sleep(24 * 60 * 60)
+
+    def _maybe_write_memory_stats(self) -> None:
+        """Woechentliche Gedaechtnis-Statistik (Owner 22.07., Zeitreihe): reine
+        SQL-/Dateisystem-Zaehlwerte, KEIN LLM. Laeuft im taeglichen Loop, feuert
+        nur sonntags (Europe/Zurich) und hoechstens 1x pro 6 Tage. Schreibt einen
+        Datenpunkt nach HERMES_HOME/memory-stats.jsonl inkl. Deltas zum letzten
+        Punkt; transient- und archive-Objekte getrennt (Papierkorb vs. echte
+        Wachstumskurve)."""
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        from hermes_constants import get_hermes_home
+
+        zurich_now = datetime.now(ZoneInfo("Europe/Zurich"))
+        if zurich_now.weekday() != 6:  # Sonntag
+            return
+        stats_file = get_hermes_home() / "memory-stats.jsonl"
+        previous: Dict[str, Any] = {}
+        try:
+            lines = stats_file.read_text(encoding="utf-8").strip().split("\n")
+            if lines and lines[-1]:
+                previous = json.loads(lines[-1])
+                last_ts = datetime.fromisoformat(previous.get("ts", "1970-01-01T00:00:00+00:00"))
+                if zurich_now - last_ts < timedelta(days=6):
+                    return
+        except FileNotFoundError:
+            pass
+        except Exception:
+            previous = {}
+
+        from tools.vault import db_runtime
+        pool = db_runtime.get_vault_pool()
+        conn = pool.getconn(timeout=db_runtime.VAULT_GETCONN_TIMEOUT_S)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT"
+                    " (SELECT count(*) FROM memory_items WHERE deleted_at IS NULL"
+                    "   AND superseded_at IS NULL AND quarantined_at IS NULL),"
+                    " (SELECT count(*) FROM memory_items WHERE created_at > now() - interval '7 days'),"
+                    " (SELECT count(*) FROM memory_items WHERE deleted_at > now() - interval '7 days'"
+                    "   OR superseded_at > now() - interval '7 days'),"
+                    " (SELECT count(*) FROM memory_items WHERE deleted_at IS NULL"
+                    "   AND superseded_at IS NULL AND (summary_redacted LIKE 'Aus %uebernommen%'"
+                    "   OR summary_redacted LIKE 'Aus %übernommen%')),"
+                    " (SELECT count(*) FROM memory_items WHERE deleted_at IS NULL"
+                    "   AND superseded_at IS NULL AND embedding IS NULL),"
+                    " (SELECT count(*) FROM object_metadata WHERE deleted_at IS NULL"
+                    "   AND expires_at IS NOT NULL),"
+                    " (SELECT coalesce(sum(byte_size),0) FROM object_metadata"
+                    "   WHERE deleted_at IS NULL AND expires_at IS NOT NULL),"
+                    " (SELECT count(*) FROM object_metadata WHERE deleted_at IS NULL"
+                    "   AND expires_at IS NULL),"
+                    " (SELECT coalesce(sum(byte_size),0) FROM object_metadata"
+                    "   WHERE deleted_at IS NULL AND expires_at IS NULL),"
+                    " pg_database_size(current_database())"
+                )
+                row = cur.fetchone()
+        finally:
+            pool.putconn(conn)
+
+        home = get_hermes_home()
+
+        def _dir_bytes(path: Path) -> int:
+            try:
+                return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+            except Exception:
+                return 0
+
+        point: Dict[str, Any] = {
+            "ts": zurich_now.isoformat(),
+            "aktive_eintraege": row[0],
+            "neu_7d": row[1],
+            "entfernt_7d": row[2],
+            "aus_fremdinhalt": row[3],
+            "embedding_rueckstand": row[4],
+            "objekte_transient": row[5],
+            "objekte_transient_bytes": int(row[6]),
+            "objekte_archiv": row[7],
+            "objekte_archiv_bytes": int(row[8]),
+            "vault_db_bytes": int(row[9]),
+            "attachments_transient_fs_bytes": _dir_bytes(home / "jarvis-attachments" / "transient"),
+            "attachments_archive_fs_bytes": _dir_bytes(home / "jarvis-attachments" / "archive"),
+            "state_db_bytes": (home / "state.db").stat().st_size if (home / "state.db").exists() else 0,
+        }
+        for key in ("aktive_eintraege", "vault_db_bytes", "state_db_bytes",
+                    "objekte_archiv_bytes"):
+            prev_val = previous.get(key)
+            if isinstance(prev_val, int):
+                point[f"delta_{key}"] = point[key] - prev_val
+        with stats_file.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(point, ensure_ascii=False) + "\n")
+        logger.info(
+            "memory stats: %s Eintraege (+%s/-%s Woche), Archiv %s Objekte/%.1f MB, "
+            "Vault-DB %.1f MB, Dialog-DB %.1f MB",
+            row[0], row[1], row[2], row[7], int(row[8]) / 1e6,
+            int(row[9]) / 1e6, point["state_db_bytes"] / 1e6,
+        )
 
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
