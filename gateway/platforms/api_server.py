@@ -3267,11 +3267,18 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             previous = {}
 
+        # RLS: die Zaehlwerte brauchen die Owner-Identitaet als GUCs
+        # (Bestandsmuster vault_transaction) -- ohne sie liefert die App-Rolle 0.
+        tenant = os.getenv("JARVIS_VAULT_TENANT_ID", "").strip()
+        owner = os.getenv("JARVIS_VAULT_OWNER_ID", "").strip()
+        if not tenant or not owner:
+            return
         from tools.vault import db_runtime
+        from tools.vault.vault_store import vault_transaction
         pool = db_runtime.get_vault_pool()
         conn = pool.getconn(timeout=db_runtime.VAULT_GETCONN_TIMEOUT_S)
         try:
-            with conn.cursor() as cur:
+            with vault_transaction(conn, tenant, owner) as cur:
                 cur.execute(
                     "SELECT"
                     " (SELECT count(*) FROM memory_items WHERE deleted_at IS NULL"
@@ -3295,6 +3302,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     " pg_database_size(current_database())"
                 )
                 row = cur.fetchone()
+            conn.commit()
         finally:
             pool.putconn(conn)
 
