@@ -13,7 +13,12 @@ Canon: ADR-0044 Stufe 2 (:193-227), ADR-0041 §G (:605, :674, :718), VAULTSTORE_
 import pytest
 
 from tools.vault import vault_store as vs
-from tools.vault.vault_store import MemoryWrite, MemoryInvalidate, VaultStore
+from tools.vault.vault_store import (
+    MemoryWrite,
+    MemoryInvalidate,
+    ObjectMetadataWrite,
+    VaultStore,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -31,17 +36,26 @@ class FakeCursor:
         if "UPDATE public.memory_items" in sql:
             self.rowcount = self._conn.update_rowcount
 
+    def fetchone(self):
+        return self._conn.fetchone_result
+
+    def fetchall(self):
+        return list(self._conn.fetchall_result)
+
 
 class FakeConn:
     """Duck-typed DB-API-Connection. Zeichnet execute/commit/rollback auf."""
 
-    def __init__(self, *, fail_commit=False, fail_on_memory_insert=False, update_rowcount=1):
+    def __init__(self, *, fail_commit=False, fail_on_memory_insert=False,
+                 update_rowcount=1, fetchone_result=None, fetchalls_result=None):
         self.executed = []
         self.committed = False
         self.rolled_back = False
         self._fail_commit = fail_commit
         self._fail_on_memory_insert = fail_on_memory_insert
         self.update_rowcount = update_rowcount   # betroffene Zeilen eines §5b-UPDATE
+        self.fetchone_result = fetchone_result
+        self.fetchall_result = fetchalls_result or []
 
     def cursor(self):
         return FakeCursor(self)
@@ -359,6 +373,57 @@ def test_raw_sink_failure_is_error_before_db(monkeypatch):
         _req(source_table=vs.SOURCE_TABLE_OBJECT, raw_bytes=b"x"))
     assert res.status == vs.STATUS_ERROR and res.persisted is False
     assert conn.executed == [] and conn.committed is False
+
+
+def test_transient_object_metadata_write_has_expiry_but_no_memory_row():
+    conn = FakeConn()
+    res = _store(conn).write_object_metadata(
+        ObjectMetadataWrite(
+            tenant_id="tenant-a",
+            owner_id="owner-primary",
+            source=vs.SOURCE_INGEST,
+            trust_level=vs.TRUST_UNTRUSTED,
+            object_key="att_0123456789abcdef",  # gitleaks:allow -- test fixture, not a secret
+            key_ref="per_owner_domain:abc",
+            expires_at="2026-07-29T12:00:00+00:00",
+            content_type="image/jpeg",
+            byte_size=1234,
+        )
+    )
+
+    assert res.status == vs.STATUS_WRITTEN and res.persisted is True
+    sqls = [sql for sql, _ in conn.executed]
+    assert any("INSERT INTO public.object_metadata" in sql for sql in sqls)
+    assert not any("INSERT INTO public.memory_items" in sql for sql in sqls)
+
+
+def test_forget_object_marks_metadata_and_linked_memory_in_one_transaction():
+    conn = FakeConn(update_rowcount=1)
+    res = _store(conn).forget_object(
+        tenant_id="tenant-a",
+        owner_id="owner-primary",
+        object_key="obj_0123456789abcdef",  # gitleaks:allow -- test fixture, not a secret
+    )
+
+    assert res.status == vs.STATUS_INVALIDATED and res.persisted is True
+    sqls = [sql for sql, _ in conn.executed]
+    assert any("UPDATE public.object_metadata SET deleted_at" in sql for sql in sqls)
+    assert any("UPDATE public.memory_items SET deleted_at" in sql for sql in sqls)
+    assert conn.committed is True
+
+
+def test_transient_expiry_tombstones_only_metadata_not_permanent_memory():
+    conn = FakeConn(update_rowcount=1)
+    res = _store(conn).delete_transient_object(
+        tenant_id="tenant-a",
+        owner_id="owner-primary",
+        object_key="obj_0123456789abcdef",  # gitleaks:allow -- test fixture, not a secret
+    )
+
+    assert res.status == vs.STATUS_INVALIDATED and res.persisted is True
+    sqls = [sql for sql, _ in conn.executed]
+    assert any("UPDATE public.object_metadata SET deleted_at" in sql for sql in sqls)
+    assert not any("UPDATE public.memory_items SET deleted_at" in sql for sql in sqls)
 
 
 # ---------------------------------------------------------------------------

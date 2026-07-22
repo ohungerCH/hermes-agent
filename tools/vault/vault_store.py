@@ -29,6 +29,7 @@ in Stufe 5. Die Krypto-Instanz + der Object-Sink werden injiziert (kein Keystore
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
@@ -226,6 +227,24 @@ class MemoryInvalidate:
 
 
 @dataclass
+class ObjectMetadataWrite:
+    """Metadaten-only write for encrypted transient objects.
+
+    Raw bytes remain in the object-store filesystem.  This request deliberately
+    cannot carry bytes or create a memory_items row.
+    """
+    tenant_id: str
+    owner_id: str
+    source: str
+    trust_level: str
+    object_key: str
+    key_ref: str
+    expires_at: Any = None
+    content_type: Optional[str] = None
+    byte_size: Optional[int] = None
+
+
+@dataclass
 class MemoryRecall:
     """Eine Recall-/Lese-Anfrage (Stufe 6, tsvector-Fläche). Trägt KEINEN neuen Content -- sie liest
     nur owner-eigene, confirmed Zeilen (RLS + WHERE-Kontrakt). ``tenant_id``/``owner_id`` kommen
@@ -352,6 +371,35 @@ _OBJECT_METADATA_INSERT = (
     "INSERT INTO public.object_metadata (" + ", ".join(_OBJECT_METADATA_COLUMNS) + ") "
     "VALUES (" + ", ".join(["%s"] * len(_OBJECT_METADATA_COLUMNS)) + ") "
     "ON CONFLICT ON CONSTRAINT objmeta_key_uq DO NOTHING"
+)
+
+_TRANSIENT_OBJECT_METADATA_COLUMNS = _OBJECT_METADATA_COLUMNS + (
+    "expires_at", "content_type", "byte_size",
+)
+_TRANSIENT_OBJECT_METADATA_INSERT = (
+    "INSERT INTO public.object_metadata (" + ", ".join(_TRANSIENT_OBJECT_METADATA_COLUMNS) + ") "
+    "VALUES (" + ", ".join(["%s"] * len(_TRANSIENT_OBJECT_METADATA_COLUMNS)) + ") "
+    "ON CONFLICT ON CONSTRAINT objmeta_key_uq DO UPDATE SET "
+    "expires_at = EXCLUDED.expires_at, content_type = EXCLUDED.content_type, "
+    "byte_size = EXCLUDED.byte_size, deleted_at = NULL"
+)
+_OBJECT_METADATA_READ = (
+    "SELECT tenant_id, owner_id, object_key, key_ref, expires_at, content_type, byte_size, deleted_at "
+    "FROM public.object_metadata WHERE object_key = %s AND deleted_at IS NULL"
+)
+_OBJECT_METADATA_EXPIRED = (
+    "SELECT tenant_id, owner_id, object_key, key_ref, expires_at, content_type, byte_size, deleted_at "
+    "FROM public.object_metadata WHERE expires_at IS NOT NULL AND expires_at <= %s "
+    "AND deleted_at IS NULL ORDER BY expires_at LIMIT 1000"
+)
+_OBJECT_METADATA_DELETE = (
+    "UPDATE public.object_metadata SET deleted_at = now() "
+    "WHERE tenant_id = %s AND owner_id = %s AND object_key = %s AND deleted_at IS NULL"
+)
+_LINKED_MEMORY_DELETE = (
+    "UPDATE public.memory_items SET deleted_at = now() "
+    "WHERE tenant_id = %s AND owner_id = %s AND source_table = 'object_metadata' "
+    "AND source_id = %s AND deleted_at IS NULL"
 )
 
 # §5b Invalidierung -- zielgerichteter UPDATE über den Natural-Key (kein Insert, kein Upsert:
@@ -540,6 +588,156 @@ class VaultStore:
         # (5) Persistieren.
         return self._persist(req, tenant, owner, lifecycle, resolved_source, untrusted,
                              sanitization_state=sanitization_state)
+
+    def write_object_metadata(self, req: ObjectMetadataWrite) -> WriteResult:
+        """Persist metadata for an already encrypted object, never its bytes."""
+        try:
+            tenant = normalize_context_value(req.tenant_id, "tenant_id")
+            owner = normalize_context_value(req.owner_id, "owner_id")
+        except VaultContextError as e:
+            return WriteResult(status=STATUS_REFUSED, persisted=False, message=str(e))
+        if req.source not in VALID_SOURCES or req.trust_level not in VALID_TRUST_LEVELS:
+            return WriteResult(status=STATUS_REFUSED, persisted=False,
+                               message="unbekannte Objekt-Provenienz")
+        if not isinstance(req.object_key, str) or not req.object_key:
+            return WriteResult(status=STATUS_REFUSED, persisted=False, message="object_key fehlt")
+        if not isinstance(req.key_ref, str) or not req.key_ref.startswith("per_owner_domain:"):
+            return WriteResult(status=STATUS_REFUSED, persisted=False, message="key_ref ungueltig")
+        if req.byte_size is not None and (not isinstance(req.byte_size, int) or req.byte_size < 0):
+            return WriteResult(status=STATUS_REFUSED, persisted=False, message="byte_size ungueltig")
+        conn = self._connect()
+        try:
+            with vault_transaction(conn, tenant, owner) as cur:
+                cur.execute(_TRANSIENT_OBJECT_METADATA_INSERT, (
+                    tenant, owner, req.source, req.trust_level, req.object_key,
+                    req.key_ref, req.expires_at, req.content_type, req.byte_size,
+                ))
+            conn.commit()
+        except BaseException as e:  # noqa: BLE001
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.error("vault object metadata write failed: %s", type(e).__name__)
+            return WriteResult(status=STATUS_ERROR, persisted=False,
+                               message="Objekt-Metadaten nicht committet")
+        return WriteResult(status=STATUS_WRITTEN, persisted=True,
+                           object_metadata_written=True)
+
+    @staticmethod
+    def _object_row(row: Any) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        keys = ("tenant_id", "owner_id", "object_key", "key_ref", "expires_at",
+                "content_type", "byte_size", "deleted_at")
+        if isinstance(row, dict):
+            return {key: row.get(key) for key in keys}
+        return dict(zip(keys, row))
+
+    def read_object_metadata(self, *, tenant_id: str, owner_id: str,
+                             object_key: str) -> Optional[Dict[str, Any]]:
+        try:
+            tenant = normalize_context_value(tenant_id, "tenant_id")
+            owner = normalize_context_value(owner_id, "owner_id")
+        except VaultContextError:
+            return None
+        conn = self._connect()
+        try:
+            with vault_transaction(conn, tenant, owner) as cur:
+                cur.execute(_OBJECT_METADATA_READ, (object_key,))
+                row = cur.fetchone()
+        except BaseException as e:  # noqa: BLE001
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.warning("vault object metadata read failed: %s", type(e).__name__)
+            return None
+        return self._object_row(row)
+
+    def list_expired_objects(self, *, now: Any) -> list[Dict[str, Any]]:
+        """Admin-local cleanup query; RLS still scopes rows to the configured owner."""
+        # The cleanup process is single-owner in this slice; identity is deployment-owned.
+        tenant = os.getenv("JARVIS_VAULT_TENANT_ID", "").strip()
+        owner = os.getenv("JARVIS_VAULT_OWNER_ID", "").strip()
+        if not tenant or not owner:
+            return []
+        conn = self._connect()
+        try:
+            with vault_transaction(conn, tenant, owner) as cur:
+                cur.execute(_OBJECT_METADATA_EXPIRED, (now,))
+                rows = cur.fetchall()
+        except BaseException as e:  # noqa: BLE001
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.warning("vault expired-object list failed: %s", type(e).__name__)
+            return []
+        return [item for item in (self._object_row(row) for row in rows) if item]
+
+    def delete_transient_object(self, *, tenant_id: str, owner_id: str,
+                                object_key: str) -> WriteResult:
+        """Expire payload metadata while preserving permanent extracted meaning."""
+        try:
+            tenant = normalize_context_value(tenant_id, "tenant_id")
+            owner = normalize_context_value(owner_id, "owner_id")
+        except VaultContextError as e:
+            return WriteResult(status=STATUS_REFUSED, persisted=False, message=str(e))
+        if not isinstance(object_key, str) or not object_key:
+            return WriteResult(status=STATUS_REFUSED, persisted=False, message="object_key fehlt")
+        conn = self._connect()
+        affected = 0
+        try:
+            with vault_transaction(conn, tenant, owner) as cur:
+                cur.execute(_OBJECT_METADATA_DELETE, (tenant, owner, object_key))
+                rc = getattr(cur, "rowcount", 0)
+                affected = rc if isinstance(rc, int) and rc > 0 else 0
+            conn.commit()
+        except BaseException as e:  # noqa: BLE001
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.error("vault transient expiry failed: %s", type(e).__name__)
+            return WriteResult(status=STATUS_ERROR, persisted=False,
+                               message="Objekt-Ablauf nicht committet")
+        return WriteResult(status=STATUS_INVALIDATED, persisted=True,
+                           memory_item_written=False,
+                           object_metadata_written=(affected > 0))
+
+    def forget_object(self, *, tenant_id: str, owner_id: str,
+                      object_key: str) -> WriteResult:
+        """Atomically tombstone object metadata and its linked meaning row."""
+        try:
+            tenant = normalize_context_value(tenant_id, "tenant_id")
+            owner = normalize_context_value(owner_id, "owner_id")
+        except VaultContextError as e:
+            return WriteResult(status=STATUS_REFUSED, persisted=False, message=str(e))
+        if not isinstance(object_key, str) or not object_key:
+            return WriteResult(status=STATUS_REFUSED, persisted=False, message="object_key fehlt")
+        conn = self._connect()
+        affected = 0
+        try:
+            with vault_transaction(conn, tenant, owner) as cur:
+                cur.execute(_OBJECT_METADATA_DELETE, (tenant, owner, object_key))
+                rc = getattr(cur, "rowcount", 0)
+                affected += rc if isinstance(rc, int) and rc > 0 else 0
+                cur.execute(_LINKED_MEMORY_DELETE, (tenant, owner, object_key))
+                rc = getattr(cur, "rowcount", 0)
+                affected += rc if isinstance(rc, int) and rc > 0 else 0
+            conn.commit()
+        except BaseException as e:  # noqa: BLE001
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.error("vault object forget failed: %s", type(e).__name__)
+            return WriteResult(status=STATUS_ERROR, persisted=False,
+                               message="Objekt-Loeschung nicht committet")
+        return WriteResult(status=STATUS_INVALIDATED, persisted=True,
+                           memory_item_written=(affected > 0),
+                           object_metadata_written=(affected > 0))
 
     def invalidate(self, inv: MemoryInvalidate) -> WriteResult:
         """§5b Edit/Delete-Propagation: markiert die bestehende Zeile (Natural-Key) als gelöscht
