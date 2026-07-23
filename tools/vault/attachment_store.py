@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -27,6 +28,7 @@ from tools.vault.vault_store import (
 
 ATTACHMENT_TTL = timedelta(days=7)
 ATTACHMENT_REF_RE = re.compile(r"^att_[0-9a-f]{16,64}$")
+logger = logging.getLogger(__name__)
 
 
 class AttachmentStoreError(RuntimeError):
@@ -200,6 +202,38 @@ class AttachmentStore:
         Transient-Unlink. Jeder Fehler vor dem letzten Schritt lässt das transiente
         Original und damit die Wiederholbarkeit erhalten.
         """
+        row, prepared = self._prepare_archive_promotion(
+            object_key,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            original=original,
+        )
+        if prepared is None:
+            return False
+        self.finalize_archive_promotion(
+            object_key,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            content_type=prepared["content_type"],
+            byte_size=prepared["byte_size"],
+            # Keep = bewusstes Owner-Kuratieren: gleiche Provenienz wie der
+            # api_server-Keep-Pfad (Review 22.07./W1; _OWNER_RESURRECT haengt
+            # an source == foreground_owner).
+            source=SOURCE_FOREGROUND_OWNER,
+            trust_level=TRUST_TRUSTED,
+            key_ref=prepared["key_ref"],
+        )
+        return True
+
+    def _prepare_archive_promotion(
+        self,
+        object_key: str,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        original: bool = False,
+    ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+        """Gemeinsamer Keep-/Split-Vorlauf bis zum durablem Archiv-Ciphertext."""
         row = self._metadata.read_object_metadata(
             tenant_id=tenant_id,
             owner_id=owner_id,
@@ -208,7 +242,7 @@ class AttachmentStore:
         if not row:
             raise AttachmentStoreError("attachment metadata unavailable")
         if row.get("expires_at") is None:
-            return False
+            return row, None
         loaded = self.load(
             object_key,
             tenant_id=tenant_id,
@@ -221,20 +255,61 @@ class AttachmentStore:
         )
         encrypted = self._crypto.encrypt(raw_bytes, owner_id=owner_id)
         self.write_archive_envelope(object_key, encrypted["envelope"])
-        self.finalize_archive_promotion(
+        return row, {
+            "content_type": content_type,
+            "byte_size": len(raw_bytes),
+            "key_ref": encrypted["key_ref"],
+        }
+
+    def forget_content_keep_object(
+        self,
+        object_key: str,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        item_id: str,
+        stub_summary: str,
+    ) -> Any:
+        """Archiviert das Objekt und ersetzt seine Meaning-Zeile atomar durch den Stub."""
+        row, prepared = self._prepare_archive_promotion(
             object_key,
             tenant_id=tenant_id,
             owner_id=owner_id,
-            content_type=content_type,
-            byte_size=len(raw_bytes),
-            # Keep = bewusstes Owner-Kuratieren: gleiche Provenienz wie der
-            # api_server-Keep-Pfad (Review 22.07./W1; _OWNER_RESURRECT haengt
-            # an source == foreground_owner).
-            source=SOURCE_FOREGROUND_OWNER,
-            trust_level=TRUST_TRUSTED,
-            key_ref=encrypted["key_ref"],
         )
-        return True
+        metadata = prepared or {
+            "content_type": str(row.get("content_type") or "application/octet-stream"),
+            "byte_size": int(row.get("byte_size") or 0),
+            "key_ref": str(row.get("key_ref") or ""),
+        }
+        try:
+            result = self._metadata.promote_object_and_replace_memory_with_stub(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                item_id=item_id,
+                object_key=object_key,
+                stub_summary=stub_summary,
+                key_ref=metadata["key_ref"],
+                content_type=metadata["content_type"],
+                byte_size=metadata["byte_size"],
+            )
+            if not getattr(result, "persisted", False):
+                raise AttachmentStoreError("archive stub transaction was not persisted")
+        except Exception:
+            if prepared is not None:
+                try:
+                    self._path(object_key, archive=True).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+        if prepared is not None:
+            try:
+                self._path(object_key).unlink(missing_ok=True)
+            except OSError:
+                # DB + Archiv-Ciphertext sind autoritativ und konsistent; eine
+                # redundante transiente Hülle darf keinen falschen Misserfolg
+                # nach bereits committetem Split erzeugen.
+                logger.warning("transient attachment cleanup after split failed")
+        return result
 
     def finalize_archive_promotion(self, object_key: str, *, tenant_id: str,
                                    owner_id: str, content_type: str,
@@ -381,6 +456,12 @@ class PooledVaultMetadataStore:
 
     def tombstone_memory_item_by_id(self, **kwargs: Any) -> Any:
         return self._call("tombstone_memory_item_by_id", **kwargs)
+
+    def promote_object_and_replace_memory_with_stub(self, **kwargs: Any) -> Any:
+        return self._call(
+            "promote_object_and_replace_memory_with_stub",
+            **kwargs,
+        )
 
 
 def create_attachment_store() -> AttachmentStore:

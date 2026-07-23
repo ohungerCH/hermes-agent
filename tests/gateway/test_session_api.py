@@ -1264,6 +1264,102 @@ async def test_owner_chat_session_gets_server_memory_and_explicit_empty_override
 
 
 @pytest.mark.asyncio
+async def test_owner_chat_memory_request_class_is_validated_and_forwarded(
+    auth_adapter,
+):
+    mock_run = AsyncMock(
+        return_value=(
+            {"final_response": "safe answer", "session_id": "owner-chat"},
+            {"total_tokens": 1},
+        )
+    )
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            owner_create = await cli.post(
+                "/api/sessions",
+                json={"id": "owner-chat", "owner_chat": True},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert owner_create.status == 201
+            plain_create = await cli.post(
+                "/api/sessions",
+                json={"id": "plain-chat"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert plain_create.status == 201
+
+            accepted = await cli.post(
+                "/api/sessions/owner-chat/chat",
+                json={
+                    "message": "Vergiss den Inhalt.",
+                    "memory_request_class": "split",
+                    "memory_disambiguated": True,
+                },
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert accepted.status == 200, await accepted.text()
+            accepted_kwargs = mock_run.await_args_list[-1].kwargs
+
+            invalid = await cli.post(
+                "/api/sessions/owner-chat/chat",
+                json={"message": "Vergiss den Inhalt.", "memory_request_class": "invented"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert invalid.status == 400
+            invalid_payload = await invalid.json()
+
+            plain = await cli.post(
+                "/api/sessions/plain-chat/chat",
+                json={"message": "hello", "memory_request_class": "split"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert plain.status == 403
+
+    assert accepted_kwargs["memory_request_class"] == "split"
+    assert accepted_kwargs["memory_disambiguated"] is True
+    assert invalid_payload["error"]["code"] == "invalid_memory_request_class"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_memory_request_class_reaches_tool_layer(
+    adapter,
+    tmp_path,
+    monkeypatch,
+):
+    import json
+
+    from tools.memory_tool import MemoryStore, memory_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    observed = {}
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def run_conversation(self, user_message, conversation_history, task_id):
+            observed.update(json.loads(memory_tool(
+                action="add",
+                target="memory",
+                content="Dieser Write muss gesperrt werden.",
+                store=MemoryStore(),
+            )))
+            return {"final_response": "ok"}
+
+    adapter._create_agent = Mock(return_value=FakeAgent())
+    await adapter._run_agent(
+        user_message="Vergiss den Inhalt.",
+        conversation_history=[],
+        session_id="scribe-split",
+        memory_request_class="split",
+    )
+
+    assert observed["outcome"] == "write_forbidden"
+
+
+@pytest.mark.asyncio
 async def test_session_chat_stream_accepts_multimodal_message(adapter, session_db):
     session_id = session_db.create_session("image-stream-session", "api_server")
     image_payload = [

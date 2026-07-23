@@ -28,6 +28,7 @@ in Stufe 5. Die Krypto-Instanz + der Object-Sink werden injiziert (kein Keystore
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -496,6 +497,25 @@ _MEMORY_ITEM_DELETE_BY_ID = (
     "WHERE id = %s AND deleted_at IS NULL AND quarantined_at IS NULL "
     "AND superseded_at IS NULL"
 )
+_OBJECT_METADATA_ARCHIVE_PROMOTE = (
+    "UPDATE public.object_metadata SET "
+    "source = %s, trust_level = %s, key_ref = %s, expires_at = NULL, "
+    "content_type = %s, byte_size = %s "
+    "WHERE tenant_id = %s AND owner_id = %s AND object_key = %s "
+    "AND deleted_at IS NULL"
+)
+_MEMORY_ITEM_ARCHIVE_STUB = (
+    "UPDATE public.memory_items SET "
+    "source = 'foreground_owner', trust_level = 'trusted', "
+    "summary_redacted = %s, source_hash = %s, "
+    "redaction_state = 'applied', redaction_version = 'archive_stub_v1', "
+    "sanitization_state = 'applied', from_untrusted_inbound = FALSE, "
+    "lifecycle_status = 'confirmed', embedding = NULL, "
+    "embedding_job_id = NULL, reindex_state = 'stale' "
+    "WHERE id = %s AND source_table = 'object_metadata' AND source_id = %s "
+    "AND deleted_at IS NULL AND quarantined_at IS NULL "
+    "AND superseded_at IS NULL"
+)
 
 # §5b Invalidierung -- zielgerichteter UPDATE über den Natural-Key (kein Insert, kein Upsert:
 # ein Upsert könnte bei Cold-Start eine Geister-Tombstone-Zeile INSERTen; ein UPDATE mit 0
@@ -859,6 +879,95 @@ class VaultStore:
             status=STATUS_INVALIDATED,
             persisted=True,
             memory_item_written=(affected > 0),
+        )
+
+    def promote_object_and_replace_memory_with_stub(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        item_id: str,
+        object_key: str,
+        stub_summary: str,
+        key_ref: str,
+        content_type: str,
+        byte_size: int,
+    ) -> WriteResult:
+        """Promotet Objektmetadaten und ersetzt den Inhalt atomar durch einen Stub."""
+        try:
+            tenant = normalize_context_value(tenant_id, "tenant_id")
+            owner = normalize_context_value(owner_id, "owner_id")
+        except VaultContextError as exc:
+            return WriteResult(
+                status=STATUS_REFUSED,
+                persisted=False,
+                message=str(exc),
+            )
+        normalized_item_id = normalize_memory_item_id(item_id)
+        if (
+            normalized_item_id is None
+            or not isinstance(object_key, str)
+            or not object_key
+            or not isinstance(stub_summary, str)
+            or not stub_summary.strip()
+        ):
+            return WriteResult(
+                status=STATUS_REFUSED,
+                persisted=False,
+                message="Archiv-Stub ist unvollständig",
+            )
+        source_hash = hashlib.sha256(
+            stub_summary.strip().encode("utf-8")
+        ).hexdigest()
+        conn = self._connect()
+        try:
+            with vault_transaction(conn, tenant, owner) as cur:
+                cur.execute(
+                    _OBJECT_METADATA_ARCHIVE_PROMOTE,
+                    (
+                        SOURCE_FOREGROUND_OWNER,
+                        TRUST_TRUSTED,
+                        key_ref,
+                        content_type,
+                        byte_size,
+                        tenant,
+                        owner,
+                        object_key,
+                    ),
+                )
+                if getattr(cur, "rowcount", 0) != 1:
+                    raise VaultStoreError("object metadata not promoted")
+                cur.execute(
+                    _MEMORY_ITEM_ARCHIVE_STUB,
+                    (
+                        stub_summary.strip(),
+                        source_hash,
+                        normalized_item_id,
+                        object_key,
+                    ),
+                )
+                if getattr(cur, "rowcount", 0) != 1:
+                    raise VaultStoreError("memory item not replaced")
+            conn.commit()
+        except BaseException as exc:  # noqa: BLE001
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.error(
+                "vault archive-stub transaction failed: %s",
+                type(exc).__name__,
+            )
+            return WriteResult(
+                status=STATUS_ERROR,
+                persisted=False,
+                message="Archivierung und Inhaltslöschung wurden nicht gemeinsam gespeichert",
+            )
+        return WriteResult(
+            status=STATUS_WRITTEN,
+            persisted=True,
+            memory_item_written=True,
+            object_metadata_written=True,
         )
 
     def list_expired_objects(self, *, now: Any) -> list[Dict[str, Any]]:

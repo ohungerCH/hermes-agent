@@ -1,10 +1,19 @@
-"""Task #16: ID-basierter Löschpfad für Dokument-Erinnerungen."""
+"""Task #16/Stufe 2: ID-Löschpfad und deterministische Scribe-Schranken."""
 
-from datetime import datetime, timezone
+from contextlib import contextmanager
 import json
 
-from tools.memory_tool import MemoryStore, memory_tool
+import pytest
+
+from tools.memory_tool import (
+    MemoryStore,
+    begin_memory_tool_turn,
+    end_memory_tool_turn,
+    memory_tool,
+    record_memory_tool_outcome,
+)
 from tools.vault import vault_wiring as vw
+from tools.vault.vault_store import VaultStore
 
 
 class _Result:
@@ -41,6 +50,7 @@ class _AttachmentStore:
         self.promotion_fails = promotion_fails
         self.promotions = []
         self.deleted_ciphertexts = []
+        self.splits = []
 
     def promote_to_archive(self, object_key, **kwargs):
         self.promotions.append((object_key, kwargs))
@@ -50,6 +60,10 @@ class _AttachmentStore:
 
     def delete_ciphertext(self, object_key):
         self.deleted_ciphertexts.append(object_key)
+
+    def forget_content_keep_object(self, object_key, **kwargs):
+        self.splits.append((object_key, kwargs))
+        return _Result()
 
 
 def _arm_identity(monkeypatch):
@@ -223,3 +237,272 @@ def test_native_store_remove_old_text_remains_supported(tmp_path, monkeypatch):
     ))
     assert missing["outcome"] == "not_found"
     assert "No entry matched" not in json.dumps(missing)
+
+
+@pytest.mark.parametrize("request_class", ["forget", "split"])
+@pytest.mark.parametrize(
+    ("action", "kwargs"),
+    [
+        ("add", {"content": "Darf nicht gespeichert werden."}),
+        (
+            "replace",
+            {
+                "old_text": "Bestehender Eintrag",
+                "content": "Darf nicht ersetzt werden.",
+            },
+        ),
+    ],
+)
+def test_forget_and_split_turns_reject_add_replace_in_tool_layer(
+    tmp_path,
+    monkeypatch,
+    request_class,
+    action,
+    kwargs,
+):
+    """§6b: Die Auftragsklasse sperrt klassenfremde Writes vor dem Store."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    store = MemoryStore()
+    store.add("memory", "Bestehender Eintrag")
+    before = list(store.memory_entries)
+
+    turn = begin_memory_tool_turn(memory_request_class=request_class)
+    try:
+        out = json.loads(memory_tool(
+            action=action,
+            target="memory",
+            store=store,
+            **kwargs,
+        ))
+    finally:
+        end_memory_tool_turn(turn)
+
+    assert out == {
+        "success": False,
+        "action": action,
+        "outcome": "write_forbidden",
+        "message": (
+            "Dieser Vergiss-Auftrag darf keine Erinnerung speichern oder ersetzen"
+        ),
+    }
+    assert store.memory_entries == before
+
+
+@pytest.mark.parametrize("request_class", ["forget", "split"])
+def test_forget_and_split_turns_reject_batch_with_add_or_replace(
+    tmp_path,
+    monkeypatch,
+    request_class,
+):
+    """§6b: Auch die Batch-Naht darf das Schreibverbot nicht umgehen."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    store = MemoryStore()
+    before = list(store.memory_entries)
+
+    turn = begin_memory_tool_turn(memory_request_class=request_class)
+    try:
+        out = json.loads(memory_tool(
+            target="memory",
+            operations=[{"action": "add", "content": "Verbotener Batch-Write"}],
+            store=store,
+        ))
+    finally:
+        end_memory_tool_turn(turn)
+
+    assert out["outcome"] == "write_forbidden"
+    assert store.memory_entries == before
+
+
+@pytest.mark.parametrize(
+    ("request_class", "forget_mode"),
+    [
+        ("forget", "forget_full"),
+        ("split", "forget_content_keep_object"),
+    ],
+)
+def test_ambiguous_recall_blocks_remove_until_one_context_answer(
+    monkeypatch,
+    request_class,
+    forget_mode,
+):
+    """§5d: Mehrere Treffer können vor der Rückfrage nichts löschen."""
+    _arm_identity(monkeypatch)
+    metadata = _Metadata(_document_ref("79797979-7979-7979-7979-797979797979"))
+    attachment_store = _AttachmentStore(metadata)
+    monkeypatch.setattr(
+        "tools.vault.attachment_store.create_attachment_store",
+        lambda: attachment_store,
+    )
+
+    turn = begin_memory_tool_turn(memory_request_class=request_class)
+    try:
+        record_memory_tool_outcome(
+            "recall",
+            {
+                "action": "recall",
+                "available": True,
+                "count": 2,
+                "matches": [{"item_id": "one"}, {"item_id": "two"}],
+            },
+        )
+        blocked = json.loads(memory_tool(
+            action="remove",
+            target="memory",
+            item_id="79797979-7979-7979-7979-797979797979",
+            forget_mode=forget_mode,
+            store=MemoryStore(),
+        ))
+    finally:
+        end_memory_tool_turn(turn)
+
+    assert blocked["outcome"] == "needs_disambiguation"
+    assert metadata.reads == []
+    assert metadata.forgotten == []
+    assert attachment_store.splits == []
+
+    answered_turn = begin_memory_tool_turn(
+        memory_request_class=request_class,
+        memory_disambiguated=True,
+    )
+    try:
+        record_memory_tool_outcome(
+            "recall",
+            {
+                "action": "recall",
+                "available": True,
+                "count": 2,
+                "matches": [{"item_id": "one"}, {"item_id": "two"}],
+            },
+        )
+        allowed = json.loads(memory_tool(
+            action="remove",
+            target="memory",
+            item_id="79797979-7979-7979-7979-797979797979",
+            forget_mode=forget_mode,
+            store=MemoryStore(),
+        ))
+    finally:
+        end_memory_tool_turn(answered_turn)
+
+    assert allowed["outcome"] in {"removed", "split_done"}
+
+
+def test_forget_content_keep_object_returns_split_done(monkeypatch):
+    """§6c: Die neue Operation ist separat vom weiter gesperrten Plain-Split."""
+    _arm_identity(monkeypatch)
+    metadata = _Metadata(_document_ref("77777777-7777-7777-7777-777777777777"))
+    attachment_store = _AttachmentStore(metadata)
+
+    out = vw.vault_remove_by_item_id(
+        "77777777-7777-7777-7777-777777777777",
+        operation="forget_content_keep_object",
+        attachment_store=attachment_store,
+    )
+
+    assert out["success"] is True
+    assert out["outcome"] == "split_done"
+    assert "Inhalt" in out["message"]
+    assert len(attachment_store.splits) == 1
+    object_key, split_kwargs = attachment_store.splits[0]
+    assert object_key == "att_0123456789abcdef"
+    assert split_kwargs["tenant_id"] == "tenant-a"
+    assert split_kwargs["owner_id"] == "owner-a"
+    assert split_kwargs["item_id"] == "77777777-7777-7777-7777-777777777777"
+    assert split_kwargs["stub_summary"].startswith(
+        "Dokument att_01234567, Inhalt auf Owner-Wunsch vergessen, Datei archiviert "
+    )
+
+
+def test_memory_tool_dispatches_forget_content_keep_object(monkeypatch):
+    """§6c: Der Scribe erreicht die neue Operation über den öffentlichen Tool-Vertrag."""
+    _arm_identity(monkeypatch)
+    metadata = _Metadata(_document_ref("abababab-abab-abab-abab-abababababab"))
+    attachment_store = _AttachmentStore(metadata)
+    monkeypatch.setattr(
+        "tools.vault.attachment_store.create_attachment_store",
+        lambda: attachment_store,
+    )
+
+    out = json.loads(memory_tool(
+        action="remove",
+        target="memory",
+        item_id="abababab-abab-abab-abab-abababababab",
+        forget_mode="forget_content_keep_object",
+        store=MemoryStore(),
+    ))
+
+    assert out["outcome"] == "split_done"
+    assert len(attachment_store.splits) == 1
+
+
+def test_forget_content_keep_object_missing_item_is_not_found(monkeypatch):
+    """§7: Ein nicht existentes Dokument erzeugt keinen Split-Teilerfolg."""
+    _arm_identity(monkeypatch)
+    metadata = _Metadata(None)
+    attachment_store = _AttachmentStore(metadata)
+
+    out = vw.vault_remove_by_item_id(
+        "88888888-8888-8888-8888-888888888888",
+        operation="forget_content_keep_object",
+        attachment_store=attachment_store,
+    )
+
+    assert out["outcome"] == "not_found"
+    assert attachment_store.splits == []
+
+
+def test_archive_stub_and_object_promotion_share_one_transaction(monkeypatch):
+    """§6c: Beide DB-Autoritäten werden in einem Transaktionsfenster geändert."""
+    class _Cursor:
+        rowcount = 1
+
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, statement, params):
+            self.calls.append((statement, params))
+
+    class _Connection:
+        def __init__(self):
+            self.cursor = _Cursor()
+            self.commits = 0
+            self.rollbacks = 0
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    connection = _Connection()
+    transaction_entries = []
+
+    @contextmanager
+    def _fake_transaction(conn, tenant_id, owner_id):
+        transaction_entries.append((tenant_id, owner_id))
+        yield conn.cursor
+
+    monkeypatch.setattr(
+        "tools.vault.vault_store.vault_transaction",
+        _fake_transaction,
+    )
+    store = VaultStore(connect=lambda: connection)
+
+    out = store.promote_object_and_replace_memory_with_stub(
+        tenant_id="tenant-a",
+        owner_id="owner-a",
+        item_id="99999999-9999-9999-9999-999999999999",
+        object_key="att_0123456789abcdef",
+        stub_summary="Dokument att_01234567, Inhalt vergessen, Datei archiviert 2026-07-23",
+        key_ref="key-a",
+        content_type="image/jpeg",
+        byte_size=42,
+    )
+
+    assert out.persisted is True
+    assert transaction_entries == [("tenant-a", "owner-a")]
+    assert len(connection.cursor.calls) == 2
+    assert "UPDATE public.object_metadata" in connection.cursor.calls[0][0]
+    assert "UPDATE public.memory_items" in connection.cursor.calls[1][0]
+    assert connection.commits == 1
+    assert connection.rollbacks == 0

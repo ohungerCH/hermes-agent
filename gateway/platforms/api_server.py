@@ -694,6 +694,59 @@ def _parse_restrictive_toolset_override(
     return [], None
 
 
+def _parse_memory_request_class(
+    body: Dict[str, Any],
+    *,
+    owner_chat: bool,
+) -> tuple[Optional[str], Optional["web.Response"]]:
+    """Akzeptiert die Bridge-Klasse nur auf der privilegierten Owner-Chat-Naht."""
+    if "memory_request_class" not in body:
+        return None, None
+    if not owner_chat:
+        return None, web.json_response(
+            _openai_error(
+                "memory_request_class is only allowed for owner chat",
+                code="memory_request_class_not_allowed",
+            ),
+            status=403,
+        )
+    value = body.get("memory_request_class")
+    if value not in {"remember", "forget", "split", "keep", "none"}:
+        return None, web.json_response(
+            _openai_error(
+                "memory_request_class is invalid",
+                code="invalid_memory_request_class",
+            ),
+            status=400,
+        )
+    return value, None
+
+
+def _parse_memory_disambiguated(
+    body: Dict[str, Any],
+    *,
+    owner_chat: bool,
+    memory_request_class: Optional[str],
+) -> tuple[bool, Optional["web.Response"]]:
+    """Validiert die genau-eine-Runde-Freigabe an der Owner-Chat-Grenze."""
+    if "memory_disambiguated" not in body:
+        return False, None
+    value = body.get("memory_disambiguated")
+    if (
+        not owner_chat
+        or memory_request_class not in {"forget", "split"}
+        or not isinstance(value, bool)
+    ):
+        return False, web.json_response(
+            _openai_error(
+                "memory_disambiguated is not allowed for this request",
+                code="invalid_memory_disambiguated",
+            ),
+            status=400,
+        )
+    return value, None
+
+
 # --- Action-Intent-Extraktion (Task #35, sichere Aktuation; no_mcp BEWAHRT) --------
 #
 # Das Brain bleibt tool-los (no_mcp): es hat genau EINEN Ausgabekanal -- Text. Ein
@@ -3366,6 +3419,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
         owner_chat = session.get("source") == _OWNER_CHAT_SESSION_SOURCE
+        memory_request_class, err = _parse_memory_request_class(
+            body,
+            owner_chat=owner_chat,
+        )
+        if err is not None:
+            return err
+        memory_disambiguated, err = _parse_memory_disambiguated(
+            body,
+            owner_chat=owner_chat,
+            memory_request_class=memory_request_class,
+        )
+        if err is not None:
+            return err
         if owner_chat and enabled_toolsets_override is None:
             enabled_toolsets_override = ["memory"]
         vault_tenant_id: Optional[str] = None
@@ -3411,6 +3477,8 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key=gateway_session_key,
             vault_tenant_id=vault_tenant_id,
             vault_owner_id=vault_owner_id,
+            memory_request_class=memory_request_class,
+            memory_disambiguated=memory_disambiguated,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -5566,6 +5634,8 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         vault_tenant_id: Optional[str] = None,
         vault_owner_id: Optional[str] = None,
+        memory_request_class: Optional[str] = None,
+        memory_disambiguated: bool = False,
         route: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
@@ -5610,7 +5680,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
             vault_tok = set_vault_write_identity(vault_tenant_id, vault_owner_id)
-            memory_outcome_tok = begin_memory_tool_turn()
+            memory_outcome_tok = begin_memory_tool_turn(
+                memory_request_class=memory_request_class,
+                memory_disambiguated=memory_disambiguated,
+            )
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,

@@ -30,7 +30,9 @@ import hashlib
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
+from datetime import datetime
 from typing import Any, Dict, Iterator, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -331,7 +333,11 @@ def vault_remove_by_item_id(
             "not_found",
             "Die Erinnerung wurde nicht gefunden oder ist bereits gelöscht",
         )
-    if operation not in {"forget_memory_keep_object", "forget_full"}:
+    if operation not in {
+        "forget_memory_keep_object",
+        "forget_content_keep_object",
+        "forget_full",
+    }:
         return _remove_outcome(
             "class_not_removable",
             "Diese Löschart wird für die Erinnerung nicht unterstützt",
@@ -391,7 +397,7 @@ def vault_remove_by_item_id(
                 "store_unavailable",
                 "Das Dokument konnte nicht vollständig gelöscht werden",
             )
-    else:
+    elif operation == "forget_memory_keep_object":
         # Server-lokale Objekte dürfen über Sprache nie von ihrer einzigen
         # sichtbaren Meaning-Zeile getrennt werden. Der bewiesene Promotion-
         # Code bleibt im Attachment-Store für den expliziten API-Keep-Pfad.
@@ -401,6 +407,37 @@ def vault_remove_by_item_id(
             "keep_would_orphan",
             "Das Dokument liegt nur bei mir - ohne die Erinnerung würde es verwaisen. "
             "Sag 'Vergiss beides', dann lösche ich Dokument und Erinnerung zusammen",
+        )
+    else:
+        short_reference = object_key[:12]
+        archive_date = datetime.now(ZoneInfo("Europe/Zurich")).date().isoformat()
+        stub_summary = (
+            f"Dokument {short_reference}, Inhalt auf Owner-Wunsch vergessen, "
+            f"Datei archiviert {archive_date}"
+        )
+        try:
+            result = attachment_store.forget_content_keep_object(
+                object_key,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                item_id=normalized_item_id,
+                stub_summary=stub_summary,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("vault document split failed: %s", type(e).__name__)
+            return _remove_outcome(
+                "store_unavailable",
+                "Der Dokumentinhalt konnte nicht sicher vergessen werden",
+            )
+        if not getattr(result, "persisted", False):
+            return _remove_outcome(
+                "store_unavailable",
+                "Archivierung und Inhaltslöschung wurden nicht gemeinsam gespeichert",
+            )
+        return _remove_outcome(
+            "split_done",
+            "Der Inhalt des Dokuments wurde vergessen und die Datei dauerhaft archiviert",
+            success=True,
         )
     if not getattr(result, "persisted", False):
         return _remove_outcome(
