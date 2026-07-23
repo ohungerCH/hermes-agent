@@ -1271,7 +1271,17 @@ def memory_tool(
     old_entry = result.pop("_vault_old_entry", None) if isinstance(result, dict) else None
     try:
         from tools.vault.vault_wiring import vault_shadow_write
-        vault_shadow_write(action, target, content, store_result=result, old_entry=old_entry)
+        # Der Shadow-Vertrag bekommt den rohen Store-Snapshot. Die anschliessende
+        # Owner-Outcomes-Anreicherung mutiert ``result`` in-place und darf deshalb
+        # nicht rückwirkend den an den Hook gereichten Wert verändern.
+        shadow_result = dict(result) if isinstance(result, dict) else result
+        vault_shadow_write(
+            action,
+            target,
+            content,
+            store_result=shadow_result,
+            old_entry=old_entry,
+        )
     except Exception:
         pass
 

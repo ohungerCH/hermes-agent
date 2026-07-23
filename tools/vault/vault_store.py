@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
@@ -160,6 +161,20 @@ STATUS_RECALL_EMPTY = "recall_empty"  # recall() lief sauber, 0 Treffer (KEIN Fe
 RECALL_LIMIT_DEFAULT = 8
 RECALL_LIMIT_MAX = 25
 
+LIBRARY_SEARCH_LIMIT_DEFAULT = 6
+LIBRARY_SEARCH_LIMIT_MAX = 6
+LIBRARY_CATEGORIES = frozenset({
+    "Ausbildung-Weiterbildung", "Auto", "Behörden", "Finanzen", "Gesundheit",
+    "Job", "Kirche", "Notfall-Umschlag", "Reisen", "Scan-Archiv", "Umwelt",
+    "Versicherungen", "Wohnung",
+})
+# Diese Kategorien verlassen den Server nur nach einem expliziten Enum-Opt-in
+# im Tool-Call. Damit sind Gesundheit/Notfall strukturell geschlossen; Finanzen
+# und Kirche erhalten denselben strengeren Boden statt nur Prompt-Relevanz.
+LIBRARY_PROTECTED_CATEGORIES = frozenset({
+    "Finanzen", "Kirche", "Gesundheit", "Notfall-Umschlag",
+})
+
 
 @dataclass
 class WriteResult:
@@ -271,6 +286,38 @@ class MemoryRecall:
     query: str
     limit: int = RECALL_LIMIT_DEFAULT
     mode: str = "tsvector"
+
+
+@dataclass
+class LibrarySearch:
+    """Owner-scoped Bibliotheks-Suche mit explizitem Kategorie-Abfluss-Gate."""
+    owner_id: str
+    tenant_id: str
+    query: str
+    limit: int = LIBRARY_SEARCH_LIMIT_DEFAULT
+    include_sensitive_categories: list[str] = field(default_factory=list)
+
+
+@dataclass
+class LibrarySearchItem:
+    chunk_id: str
+    document_id: str
+    chunk_ix: int
+    text: str
+    category: str
+    provider_ref: str
+    filename: str
+    original_missing: bool
+    score: float
+
+
+@dataclass
+class LibrarySearchResult:
+    status: str
+    items: list[LibrarySearchItem] = field(default_factory=list)
+    available: bool = False
+    message: str = ""
+    mode_used: str = ""
 
 
 @dataclass
@@ -514,6 +561,38 @@ _MEMORY_ITEMS_RECALL_KNN = (
     "AND embedding IS NOT NULL "
     "ORDER BY embedding <=> %s::vector "
     "LIMIT %s"
+)
+
+# Bibliotheks-Recall: der Kategorie-Filter sitzt auf document_chunks (kein Join
+# nötig, um die Abflussentscheidung zu treffen). Der Join liefert erst danach
+# Dateiname/Status für das Quellenzitat. Beide Queries laufen unter derselben
+# Composite-RLS-Transaktion; tenant/owner erscheinen nie im Query-Text.
+_LIBRARY_RECALL_FTS = (
+    "SELECT c.id, c.document_id, c.chunk_ix, c.text, c.category, c.provider_ref, "
+    "d.filename, d.status, "
+    "ts_rank(to_tsvector('german', coalesce(c.text, '')), q) AS score "
+    "FROM public.document_chunks c "
+    "JOIN public.library_documents d ON d.id = c.document_id "
+    "CROSS JOIN websearch_to_tsquery('german', %s) AS q "
+    "WHERE c.category = ANY(%s) "
+    "AND d.status IN ('active', 'original_missing') "
+    "AND c.redaction_state = 'applied' AND c.sanitization_state = 'applied' "
+    "AND to_tsvector('german', coalesce(c.text, '')) @@ q "
+    "ORDER BY score DESC, c.chunk_ix ASC LIMIT %s"
+)
+
+_LIBRARY_RECALL_KNN = (
+    "SELECT c.id, c.document_id, c.chunk_ix, c.text, c.category, c.provider_ref, "
+    "d.filename, d.status, (1 - (c.embedding <=> %s::vector)) AS score "
+    "FROM public.document_chunks c "
+    "JOIN public.library_documents d ON d.id = c.document_id "
+    "WHERE c.category = ANY(%s) "
+    "AND d.status IN ('active', 'original_missing') "
+    "AND c.redaction_state = 'applied' AND c.sanitization_state = 'applied' "
+    "AND c.embedding IS NOT NULL "
+    "AND c.embedding_provider = %s AND c.embedding_model = %s "
+    "AND c.embedding_version = %s "
+    "ORDER BY c.embedding <=> %s::vector LIMIT %s"
 )
 
 
@@ -944,6 +1023,191 @@ class VaultStore:
             sql, params, mode_used = self._knn_or_fallback(query, limit)
             return self._run_recall(tenant, owner, sql, params, mode_used)
         return self._run_recall(tenant, owner, _MEMORY_ITEMS_RECALL, (query, limit), "tsvector")
+
+    def library_search(self, req: LibrarySearch) -> LibrarySearchResult:
+        """Hybrid-Suche im getrennten Bibliotheksraum, Top-K hart auf 6.
+
+        Das Modell kann nur explizite Enum-Kategorien öffnen. Der Query-Text
+        selbst beeinflusst die Kategorie-Menge nie; Prompt-Steering bleibt
+        dadurch ausserhalb der SQL-Abflussentscheidung.
+        """
+        try:
+            tenant = normalize_context_value(req.tenant_id, "tenant_id")
+            owner = normalize_context_value(req.owner_id, "owner_id")
+        except VaultContextError as exc:
+            return LibrarySearchResult(
+                status=STATUS_REFUSED, available=False, message=str(exc)
+            )
+        query = req.query.strip() if isinstance(req.query, str) else ""
+        if not query:
+            return LibrarySearchResult(
+                status=STATUS_RECALL_EMPTY,
+                available=True,
+                mode_used="hybrid_tsvector_only",
+            )
+        if len(query) > 4096:
+            return LibrarySearchResult(
+                status=STATUS_REFUSED,
+                available=False,
+                message="Bibliotheks-Suchbegriff ist zu lang",
+            )
+        requested = req.include_sensitive_categories
+        if requested is None:
+            requested = []
+        if not isinstance(requested, list) or any(
+            not isinstance(category, str)
+            or category not in LIBRARY_PROTECTED_CATEGORIES
+            for category in requested
+        ):
+            return LibrarySearchResult(
+                status=STATUS_REFUSED,
+                available=False,
+                message="ungültige sensitive Bibliothekskategorie",
+            )
+        included = set(requested)
+        allowed_categories = sorted(
+            (LIBRARY_CATEGORIES - LIBRARY_PROTECTED_CATEGORIES) | included
+        )
+        limit = req.limit if isinstance(req.limit, int) and not isinstance(req.limit, bool) else 6
+        limit = max(1, min(limit, LIBRARY_SEARCH_LIMIT_MAX))
+        if included:
+            # Audit VOR Embed/DB, damit auch ein fehlgeschlagener Abflussversuch
+            # sichtbar bleibt. Kein Query-/Chunk-Text im Log.
+            logger.info(
+                "library.search sensitive_categories=%s requested",
+                sorted(included),
+            )
+
+        qv = self._library_query_vector(query)
+        conn = self._connect()
+        knn_rows: list = []
+        fts_rows: list = []
+        try:
+            with vault_transaction(conn, tenant, owner) as cur:
+                if qv is not None:
+                    provider, model, version, vector_literal = qv
+                    # pgvector >=0.8: iterative Scan verhindert Under-Return
+                    # durch den category-/RLS-Postfilter. Fixes trusted SQL.
+                    cur.execute("SET LOCAL hnsw.iterative_scan = 'strict_order'")
+                    cur.execute(
+                        _LIBRARY_RECALL_KNN,
+                        (
+                            vector_literal,
+                            allowed_categories,
+                            provider,
+                            model,
+                            version,
+                            vector_literal,
+                            limit,
+                        ),
+                    )
+                    knn_rows = cur.fetchall()
+                cur.execute(
+                    _LIBRARY_RECALL_FTS,
+                    (query, allowed_categories, limit),
+                )
+                fts_rows = cur.fetchall()
+        except BaseException as exc:  # noqa: BLE001 - read fail-closed
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.error(
+                "library search failed (rolled back): %s", type(exc).__name__
+            )
+            return LibrarySearchResult(
+                status=STATUS_ERROR,
+                available=False,
+                message="Bibliothek ist gerade nicht durchsuchbar",
+                mode_used="hybrid",
+            )
+
+        rows: list = []
+        seen: set[str] = set()
+        for row in list(knn_rows) + list(fts_rows):
+            chunk_id = str(row[0]) if row else ""
+            if not chunk_id or chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            rows.append(row)
+            if len(rows) >= limit:
+                break
+        items = self._library_rows_to_items(rows, set(allowed_categories))
+        if included:
+            logger.info(
+                "library.search sensitive_categories=%s document_ids=%s",
+                sorted(included),
+                sorted({item.document_id for item in items}),
+            )
+        return LibrarySearchResult(
+            status=STATUS_RECALLED if items else STATUS_RECALL_EMPTY,
+            items=items,
+            available=True,
+            mode_used="hybrid" if qv is not None else "hybrid_tsvector_only",
+        )
+
+    def _library_query_vector(self, query: str):
+        """Lokaler Query-Vektor samt vollständigen Modell-Metadaten, fail-soft."""
+        try:
+            from tools.vault.embed_client import embed_texts, to_pgvector_literal
+
+            embedded = embed_texts([query])
+            if embedded is None or not embedded.vectors:
+                return None
+            return (
+                embedded.provider,
+                embedded.model,
+                embedded.version,
+                to_pgvector_literal(embedded.vectors[0]),
+            )
+        except Exception as exc:  # noqa: BLE001 - FTS bleibt verfügbar
+            logger.warning(
+                "library search query embedding failed: %s", type(exc).__name__
+            )
+            return None
+
+    @staticmethod
+    def _library_rows_to_items(
+        rows: list, allowed_categories: set[str]
+    ) -> list[LibrarySearchItem]:
+        """Defense-in-depth gegen DB-Anomalien hinter dem SQL-Kategorie-Gate."""
+        items: list[LibrarySearchItem] = []
+        provider_ref_re = re.compile(r"[A-Za-z0-9!._~-]{1,256}\Z")
+        for row in rows:
+            if not isinstance(row, (tuple, list)) or len(row) < 9:
+                continue
+            category = row[4]
+            status = row[7]
+            provider_ref = row[5]
+            if (
+                category not in allowed_categories
+                or category not in LIBRARY_CATEGORIES
+                or status not in {"active", "original_missing"}
+                or not isinstance(provider_ref, str)
+                or provider_ref_re.fullmatch(provider_ref) is None
+                or not isinstance(row[3], str)
+                or not isinstance(row[6], str)
+            ):
+                continue
+            try:
+                score = float(row[8])
+                chunk_ix = int(row[2])
+            except (TypeError, ValueError):
+                continue
+            items.append(
+                LibrarySearchItem(
+                    chunk_id=str(row[0]),
+                    document_id=str(row[1]),
+                    chunk_ix=chunk_ix,
+                    text=row[3],
+                    category=category,
+                    provider_ref=provider_ref,
+                    filename=row[6],
+                    original_missing=status == "original_missing",
+                    score=score,
+                )
+            )
+        return items
 
     def _query_vector(self, query: str):
         """Holt den Query-Vektor vom Embedding-Server (fail-soft). Rückgabe (version, vec_literal)

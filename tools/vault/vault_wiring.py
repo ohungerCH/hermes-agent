@@ -67,6 +67,11 @@ def vault_recall_enabled() -> bool:
     return _vault_flag("recall_enabled")
 
 
+def vault_library_search_enabled() -> bool:
+    """Separater default-aus Schalter für den Bibliotheks-Abflusspunkt."""
+    return _vault_flag("library_search_enabled")
+
+
 def vault_recall_mode() -> str:
     """Server-seitiger Default-Recall-Mode (reversibler Flag, KEIN model-facing Param -> kein
     Tool-Call-Site-Drift). 'tsvector' (Default, immer sicher) | 'knn' (rein semantisch, versteckt
@@ -506,6 +511,131 @@ def _do_vault_recall(query: str, target: str, tenant_id: str, owner_id: str,
         for it in res.items
     ]
     return {"available": True, "matches": matches, "count": len(matches), "mode_used": res.mode_used}
+
+
+# ---------------------------------------------------------------------------
+# Bibliotheks-Suche - eigenes Tool, aber dieselbe owner-chat Identity-Naht
+# ---------------------------------------------------------------------------
+
+_LIBRARY_OPEN = '<recalled_library untrusted_data="true">'
+_LIBRARY_CLOSE = "</recalled_library>"
+
+
+def _wrap_library_text(text: str) -> str:
+    return f"{_LIBRARY_OPEN}{_entity_encode(text)}{_LIBRARY_CLOSE}"
+
+
+def vault_library_search(
+    query: str,
+    *,
+    include_sensitive_categories: Optional[list[str]] = None,
+    limit: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Owner-chat-only Bibliotheks-Recall, flag-gegatet und fail-closed.
+
+    Sichtbarkeit im ``memory``-Toolset allein genügt nicht: ohne die am
+    Owner-Chat-Turn gesetzte server-autoritative Vault-Identität ist der Pfad
+    inert. Dadurch kann ein anderes Frontend das Tool nicht durch blosses
+    Aktivieren des Toolsets öffnen.
+    """
+    try:
+        if not vault_library_search_enabled():
+            return None
+        if not isinstance(query, str) or not query.strip():
+            return {
+                "available": True,
+                "matches": [],
+                "count": 0,
+                "mode_used": "hybrid_tsvector_only",
+            }
+        try:
+            from tools.write_approval import current_origin
+
+            if current_origin() not in _FOREGROUND_ORIGINS:
+                return None
+        except Exception:
+            return None
+        identity = get_vault_write_identity()
+        if identity is None:
+            return None
+        tenant_id, owner_id = identity
+        return _do_library_search(
+            query,
+            tenant_id,
+            owner_id,
+            include_sensitive_categories or [],
+            limit,
+        )
+    except Exception as exc:  # noqa: BLE001 - Tool-Turn nie brechen
+        logger.warning(
+            "library search skipped (fail-closed): %s", type(exc).__name__
+        )
+        return {
+            "available": False,
+            "matches": [],
+            "reason": "store_unavailable",
+        }
+
+
+def _do_library_search(
+    query: str,
+    tenant_id: str,
+    owner_id: str,
+    include_sensitive_categories: list[str],
+    limit: Optional[int],
+) -> Dict[str, Any]:
+    from tools.vault import db_runtime
+    from tools.vault.vault_store import (
+        LIBRARY_SEARCH_LIMIT_DEFAULT,
+        LibrarySearch,
+        VaultStore,
+    )
+
+    resolved_limit = (
+        limit if isinstance(limit, int) and not isinstance(limit, bool) else LIBRARY_SEARCH_LIMIT_DEFAULT
+    )
+    pool = db_runtime.get_vault_pool()
+    conn = pool.getconn(timeout=db_runtime.VAULT_GETCONN_TIMEOUT_S)
+    try:
+        result = VaultStore(connect=lambda: conn).library_search(
+            LibrarySearch(
+                owner_id=owner_id,
+                tenant_id=tenant_id,
+                query=query,
+                limit=resolved_limit,
+                include_sensitive_categories=include_sensitive_categories,
+            )
+        )
+    finally:
+        pool.putconn(conn)
+    if not result.available:
+        return {
+            "available": False,
+            "matches": [],
+            "reason": result.status,
+            "mode_used": result.mode_used,
+        }
+    matches = [
+        {
+            "chunk_id": item.chunk_id,
+            "document_id": item.document_id,
+            "chunk_ix": item.chunk_ix,
+            "category": item.category,
+            "content": _wrap_library_text(item.text),
+            "citation": {
+                "filename": _entity_encode(item.filename),
+                "graph_item_id": item.provider_ref,
+                "original_missing": item.original_missing,
+            },
+        }
+        for item in result.items
+    ]
+    return {
+        "available": True,
+        "matches": matches,
+        "count": len(matches),
+        "mode_used": result.mode_used,
+    }
 
 
 def vault_reindex_owner(tenant_id: str, owner_id: str, *, max_rows: int = 500) -> Dict[str, Any]:
