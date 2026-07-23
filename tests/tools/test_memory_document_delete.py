@@ -314,6 +314,123 @@ def test_forget_and_split_turns_reject_batch_with_add_or_replace(
 
 
 @pytest.mark.parametrize(
+    "forget_mode",
+    [None, "forget_memory_keep_object", "forget_full"],
+)
+def test_split_turn_rejects_every_non_split_remove_mode(monkeypatch, forget_mode):
+    """Review-P1 23.07.: split darf forget_full nie erreichen -- die Datei
+    bleibt erhalten; nur der inhalts-erhaltende Archiv-Split ist zugelassen.
+    Die Sperre sitzt in der Tool-Schicht, nicht in der Instruktion."""
+    _arm_identity(monkeypatch)
+    metadata = _Metadata(_document_ref("79797979-7979-7979-7979-797979797979"))
+    attachment_store = _AttachmentStore(metadata)
+    monkeypatch.setattr(
+        "tools.vault.attachment_store.create_attachment_store",
+        lambda: attachment_store,
+    )
+
+    turn = begin_memory_tool_turn(memory_request_class="split")
+    try:
+        out = json.loads(memory_tool(
+            action="remove",
+            target="memory",
+            item_id="79797979-7979-7979-7979-797979797979",
+            forget_mode=forget_mode,
+            store=MemoryStore(),
+        ))
+    finally:
+        end_memory_tool_turn(turn)
+
+    assert out["outcome"] == "remove_mode_forbidden"
+    assert out["success"] is False
+    # Kein Store-Zugriff: weder gelesen noch geloescht noch promoted.
+    assert metadata.reads == []
+    assert metadata.forgotten == []
+    assert attachment_store.deleted_ciphertexts == []
+    assert attachment_store.splits == []
+
+
+def test_remember_turn_rejects_remove_in_tool_layer(monkeypatch):
+    """Symmetrie zu §6b: ein Merk-Auftrag darf nie löschen."""
+    _arm_identity(monkeypatch)
+    metadata = _Metadata(_document_ref("79797979-7979-7979-7979-797979797979"))
+    attachment_store = _AttachmentStore(metadata)
+    monkeypatch.setattr(
+        "tools.vault.attachment_store.create_attachment_store",
+        lambda: attachment_store,
+    )
+
+    turn = begin_memory_tool_turn(memory_request_class="remember")
+    try:
+        out = json.loads(memory_tool(
+            action="remove",
+            target="memory",
+            item_id="79797979-7979-7979-7979-797979797979",
+            forget_mode="forget_full",
+            store=MemoryStore(),
+        ))
+    finally:
+        end_memory_tool_turn(turn)
+
+    assert out["outcome"] == "remove_forbidden"
+    assert metadata.reads == []
+    assert metadata.forgotten == []
+    assert attachment_store.deleted_ciphertexts == []
+
+
+@pytest.mark.parametrize("request_class", ["split", "remember"])
+def test_split_and_remember_turns_reject_batch_remove(
+    tmp_path,
+    monkeypatch,
+    request_class,
+):
+    """Batch-Ops tragen kein forget_mode -- remove darin ist klassenfremd."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    store = MemoryStore()
+    store.add("memory", "Bestehender Eintrag")
+    before = list(store.memory_entries)
+
+    turn = begin_memory_tool_turn(memory_request_class=request_class)
+    try:
+        out = json.loads(memory_tool(
+            target="memory",
+            operations=[{"action": "remove", "old_text": "Bestehender Eintrag"}],
+            store=store,
+        ))
+    finally:
+        end_memory_tool_turn(turn)
+
+    assert out["outcome"] in {"remove_mode_forbidden", "remove_forbidden"}
+    assert store.memory_entries == before
+
+
+def test_forget_turn_keeps_full_delete_available(monkeypatch):
+    """Gegenprobe: die forget-Klasse behält forget_full ("Vergiss beides")."""
+    _arm_identity(monkeypatch)
+    metadata = _Metadata(_document_ref("79797979-7979-7979-7979-797979797979"))
+    attachment_store = _AttachmentStore(metadata)
+    monkeypatch.setattr(
+        "tools.vault.attachment_store.create_attachment_store",
+        lambda: attachment_store,
+    )
+
+    turn = begin_memory_tool_turn(memory_request_class="forget")
+    try:
+        out = json.loads(memory_tool(
+            action="remove",
+            target="memory",
+            item_id="79797979-7979-7979-7979-797979797979",
+            forget_mode="forget_full",
+            store=MemoryStore(),
+        ))
+    finally:
+        end_memory_tool_turn(turn)
+
+    assert out["outcome"] == "removed"
+    assert attachment_store.deleted_ciphertexts == ["att_0123456789abcdef"]
+
+
+@pytest.mark.parametrize(
     ("request_class", "forget_mode"),
     [
         ("forget", "forget_full"),

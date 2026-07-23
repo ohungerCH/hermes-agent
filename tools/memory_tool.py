@@ -116,6 +116,41 @@ def _request_class_write_block(action: str) -> Optional[str]:
     }, ensure_ascii=False)
 
 
+def _request_class_remove_mode_block(
+    action: str,
+    forget_mode: Optional[str],
+) -> Optional[str]:
+    """Bindet die erlaubte Löschtiefe deterministisch an die Auftragsklasse.
+
+    Review-P1 23.07.: Eine split-Session konnte forget_full ausführen -- die
+    irreversible Fehlweg-3-Schadensklasse (Datei weg trotz "behalten"), bis
+    hierhin nur durch Instruktion verhindert. Jetzt tool-seitig: split darf
+    ausschliesslich den inhalts-erhaltenden Archiv-Split, remember gar nicht
+    löschen. forget behält alle Löschtiefen (R7 regelt den Verbund).
+    """
+    if action != "remove":
+        return None
+    request_class = _memory_request_class.get()
+    if request_class == "split" and forget_mode != "forget_content_keep_object":
+        return json.dumps({
+            "success": False,
+            "action": "remove",
+            "outcome": "remove_mode_forbidden",
+            "message": (
+                "Die Datei bleibt bei diesem Auftrag erhalten; ich darf nur "
+                "den Inhalt aus dem Gedächtnis nehmen"
+            ),
+        }, ensure_ascii=False)
+    if request_class == "remember":
+        return json.dumps({
+            "success": False,
+            "action": "remove",
+            "outcome": "remove_forbidden",
+            "message": "Dieser Merk-Auftrag darf keine Erinnerung entfernen",
+        }, ensure_ascii=False)
+    return None
+
+
 def _ambiguous_recall_remove_block(action: str) -> Optional[str]:
     """Verhindert jede Löschung vor der genau einen Kontextantwort."""
     if (
@@ -1239,6 +1274,9 @@ def memory_tool(
     request_class_block = _request_class_write_block(action)
     if request_class_block is not None:
         return request_class_block
+    remove_mode_block = _request_class_remove_mode_block(action, forget_mode)
+    if remove_mode_block is not None:
+        return remove_mode_block
     ambiguity_block = _ambiguous_recall_remove_block(action)
     if ambiguity_block is not None:
         return ambiguity_block
@@ -1312,6 +1350,16 @@ def memory_tool(
             request_class_block = _request_class_write_block("batch")
             if request_class_block is not None:
                 return request_class_block
+        # Batch-Ops tragen kein forget_mode -- ein Batch-remove kann daher nie
+        # der Archiv-Split sein und ist bei split/remember klassenfremd.
+        if any(
+            isinstance(operation, dict)
+            and operation.get("action") == "remove"
+            for operation in operations
+        ):
+            remove_mode_block = _request_class_remove_mode_block("remove", None)
+            if remove_mode_block is not None:
+                return remove_mode_block
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
