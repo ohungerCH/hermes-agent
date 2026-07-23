@@ -136,9 +136,12 @@ def _request_class_remove_mode_block(
             "success": False,
             "action": "remove",
             "outcome": "remove_mode_forbidden",
+            # Der Zusatz lenkt das Scribe-Modell direkt zum richtigen Modus
+            # (Live-Befund 23.07.: es brauchte mehrere Blind-Anlaeufe).
             "message": (
                 "Die Datei bleibt bei diesem Auftrag erhalten; ich darf nur "
-                "den Inhalt aus dem Gedächtnis nehmen"
+                "den Inhalt aus dem Gedächtnis nehmen "
+                "(forget_mode=forget_content_keep_object)"
             ),
         }, ensure_ascii=False)
     if request_class == "remember":
@@ -157,8 +160,15 @@ def _ambiguous_recall_remove_block(action: str) -> Optional[str]:
         action != "remove"
         or _memory_request_class.get() not in _WRITE_FORBIDDEN_REQUEST_CLASSES
         or _memory_recall_match_count.get() <= 1
-        or _memory_disambiguated.get()
     ):
+        return None
+    if _memory_disambiguated.get():
+        # Die Kontextantwort gibt genau EINE Löschung frei (Live-Befund
+        # 23.07.: nach der einen Rückfrage splittete der Scribe ALLE drei
+        # Kandidaten statt des einen bezeichneten). Die Freigabe wird mit
+        # dem ersten durchgelassenen remove konsumiert; jeder weitere
+        # remove im selben Turn braucht wieder eine Rückfrage.
+        _memory_disambiguated.set(False)
         return None
     return json.dumps({
         "success": False,

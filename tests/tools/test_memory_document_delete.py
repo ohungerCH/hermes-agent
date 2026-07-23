@@ -504,6 +504,65 @@ def test_ambiguous_recall_blocks_remove_until_one_context_answer(
     assert allowed["outcome"] in {"removed", "split_done"}
 
 
+@pytest.mark.parametrize(
+    ("request_class", "forget_mode"),
+    [
+        ("forget", "forget_full"),
+        ("split", "forget_content_keep_object"),
+    ],
+)
+def test_context_answer_authorizes_exactly_one_remove(
+    monkeypatch,
+    request_class,
+    forget_mode,
+):
+    """Live-Befund 23.07.: nach EINER Kontextantwort splittete der Scribe ALLE
+    Kandidaten. Die Freigabe wird mit dem ersten remove konsumiert."""
+    _arm_identity(monkeypatch)
+    metadata = _Metadata(_document_ref("79797979-7979-7979-7979-797979797979"))
+    attachment_store = _AttachmentStore(metadata)
+    monkeypatch.setattr(
+        "tools.vault.attachment_store.create_attachment_store",
+        lambda: attachment_store,
+    )
+
+    turn = begin_memory_tool_turn(
+        memory_request_class=request_class,
+        memory_disambiguated=True,
+    )
+    try:
+        record_memory_tool_outcome(
+            "recall",
+            {
+                "action": "recall",
+                "available": True,
+                "count": 3,
+                "matches": [{"item_id": "a"}, {"item_id": "b"}, {"item_id": "c"}],
+            },
+        )
+        first = json.loads(memory_tool(
+            action="remove",
+            target="memory",
+            item_id="79797979-7979-7979-7979-797979797979",
+            forget_mode=forget_mode,
+            store=MemoryStore(),
+        ))
+        second = json.loads(memory_tool(
+            action="remove",
+            target="memory",
+            item_id="79797979-7979-7979-7979-797979797979",
+            forget_mode=forget_mode,
+            store=MemoryStore(),
+        ))
+    finally:
+        end_memory_tool_turn(turn)
+
+    assert first["outcome"] in {"removed", "split_done"}
+    assert second["outcome"] == "needs_disambiguation"
+    # Genau EINE Loeschung hat den Store erreicht.
+    assert len(metadata.forgotten) + len(attachment_store.splits) == 1
+
+
 def test_forget_content_keep_object_returns_split_done(monkeypatch):
     """§6c: Die neue Operation ist separat vom weiter gesperrten Plain-Split."""
     _arm_identity(monkeypatch)
