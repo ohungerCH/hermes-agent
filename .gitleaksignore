@@ -1,0 +1,9 @@
+# False-Positives des pre-push-Gitleaks-Scans (2026-07-23):
+# "att_0123456789abcdef" ist der synthetische Attachment-Ref-Platzhalter der
+# Test-Fixtures (offensichtliches Hex-Zaehlmuster, kein Secret; identisch in
+# den Bridge-Smokes des Hauptrepos). Rule generic-api-key schlaegt auf
+# object_key-Zuweisungen an.
+2d81727320804e1127d05eff4273c2d53eeff26c:tests/tools/test_memory_document_delete.py:generic-api-key:407
+2d81727320804e1127d05eff4273c2d53eeff26c:tests/tools/test_memory_document_delete.py:generic-api-key:495
+052f40663978569d2ff7dbcc7524fc9b223ee618:tests/gateway/test_attachment_api.py:generic-api-key:387
+052f40663978569d2ff7dbcc7524fc9b223ee618:tests/tools/test_memory_document_delete.py:generic-api-key:174
